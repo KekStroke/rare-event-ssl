@@ -1,0 +1,65 @@
+{
+ "frame": {
+  "recall": 0.698,
+  "test_far": 74.5,
+  "precision": 0.825,
+  "visible50": 0.914,
+  "boundary_only": 115,
+  "merged": 32,
+  "recall_overlapping": 0.235,
+  "n_overlapping": 119,
+  "recall_isolated": 0.81,
+  "thresholds": [
+   [
+    0.5,
+    0.2
+   ],
+   [
+    0.9,
+    0.5
+   ],
+   [
+    0.9,
+    0.5
+   ]
+  ],
+  "far_matched": {
+   "50": null,
+   "100": 0.695,
+   "300": 0.708
+  }
+ },
+ "instance": {
+  "recall": 0.869,
+  "test_far": 145.7,
+  "precision": 0.75,
+  "visible50": 0.918,
+  "boundary_only": 19,
+  "merged": 26,
+  "recall_overlapping": 0.731,
+  "n_overlapping": 119,
+  "recall_isolated": 0.903,
+  "thresholds": [
+   [
+    0.1,
+    0.2,
+    0.1
+   ],
+   [
+    0.1,
+    0.5,
+    0.2
+   ],
+   [
+    0.1,
+    0.5,
+    0.1
+   ]
+  ],
+  "far_matched": {
+   "50": null,
+   "100": 0.842,
+   "300": null
+  }
+ }
+}

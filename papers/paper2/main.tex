@@ -1,0 +1,64 @@
+\documentclass[10pt,twocolumn]{article}
+\usepackage[a4paper,margin=18mm,columnsep=6mm]{geometry}
+\usepackage{booktabs,graphicx,amsmath,amssymb,xcolor,hyperref}
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+\newcommand{\Fone}{F$_1$}
+\title{Learning Where Units End: Self-Iterated Boundary Units for\\Self-Supervised Event Localisation and Dense Video-Quality Rewards}
+\author{\todo{authors}}
+\date{Proposal draft v0.1 --- 18 October 2026 --- DEFERRED by scope decision; kept as a record of hypotheses and gates}
+\begin{document}
+\maketitle
+
+\begin{abstract}
+HuBERT-style pretraining predicts discrete units at masked positions; the representation learns where units change only in so far as the objective requires it. We measure on killer-whale field recordings that the units of a strong bioacoustic teacher change at 52\% of 20\,ms tokens and no more often at event boundaries than inside events, and that two label-free segmentation signals (teacher change-points, spectral flux) co-locate with event boundaries only 1.6--1.8$\times$ above chance; units built on them do not improve boundary precision. Given the oracle result, we no longer propose event-level units as a replacement. We propose \emph{additive boundary structure}: fine 20\,ms units are kept as the main target, and a second, boundary-aware target is added; the simplest instantiation is an auxiliary boundary loss, the stronger one a self-iterated coarse codebook. Self-iteration means to alternate between (a) training a student with masked unit prediction plus an onset head and (b) re-segmenting and re-clustering the corpus with the student's own boundary posterior, admitting a segmentation into the next iteration only if it passes an alignment gate measured on a small labelled set. The same machinery yields a per-frame \emph{surprisal} that we propose as a dense, temporally localised quality reward for generated video: a boundary-aware model pretrained on keypoint and embedding trajectories of real humans scores hand and mouth artefacts as events with onsets and offsets, which no screenshot-based VLM judge provides. We lay out hypotheses, gates, experiments and risks; pilot evidence from a 14-hypothesis study on audio and telemetry is summarised.
+\end{abstract}
+
+\section{Motivation from the pilot}
+A controlled study (companion paper) established on 17 field recordings with 613 expert events that, across HuBERT-style target sources, the onset error of matched events is flat at 56--68\,ms (median) while plateaus range from 0.36 to 0.58, and that only fine-tuning moves the boundary error (to 32\,ms). Three attempts to move it through the pretext task failed in an informative way:
+\begin{itemize}\setlength{\itemsep}{1pt}
+\item \textbf{Unit flicker.} Teacher-derived $k$-means units switch at 46\% (synthetic) and 52\% (field) of tokens; $P(\text{switch}\mid\text{event boundary})=0.48$ vs 0.52 inside events. The ``where'' component of the masked-prediction objective is spent on changes unrelated to events.
+\item \textbf{Teacher change-point segments.} Merging frames by cosine change-points of the teacher (mean 3.9 tokens, switch rate 0.20) plus a segment-start head: \Fone{}$_{\tau=.2}$ 0.412 vs 0.426, onset median 64 vs 56\,ms. Segment starts fall near event boundaries with $P$=0.39 vs 0.25 inside.
+\item \textbf{Spectral-flux segments.} $P(\text{start}\mid\text{boundary})$=0.44 vs 0.24 at a 25\% start rate; below the gate of 0.6 we had set, so no run was launched.
+\item \textbf{Oracle test (H13).} With boundaries known by construction, units averaged over true event segments beat units over random segments of the same lengths ($+0.137$ \Fone{} after FT, seed-0 bootstrap CI excludes 0) but remain below plain frame units (seed-mean gap 0.086; seed-0 bootstrap $-0.055$ with CI including 0), on plateau and on boundaries. Alignment is real; replacing fine units by event-level units is not.
+\end{itemize}
+The conclusion is not that boundaries are useless but that (i) \emph{label-free hand-crafted segmentations are not event segmentations} and (ii) \emph{event-level units cannot replace fine units}. Any boundary mechanism must be additive to fine units, and the first competitor to beat is the simplest one: frame units plus an auxiliary boundary loss.
+
+\section{Hypotheses}
+\begin{description}\setlength{\itemsep}{1pt}
+\item[H-A (alignment drives localisation).] Holding the unit vocabulary fixed, $\tau_{50}$ of a frozen probe decreases monotonically with $P(\text{unit switch}\mid\text{event boundary})$ of the target sequence. Testable with synthetic targets whose alignment is controlled.
+\item[H-B (self-iteration converges).] A student's onset posterior, after one supervised calibration on $\le$100 events, segments unlabelled audio with alignment $\ge$0.6, and units re-clustered on these segments raise \Fone{}$_{\tau\le0.1}$ by $\ge$0.05 without lowering the plateau.
+\item[H-C (hierarchy).] Fine 20\,ms units for boundaries and coarse segment units for semantics in one model (two heads, shared trunk) beat either alone once the coarse units are boundary-aligned; the failure of the mel+AVES dual codebook was a failure of the low-information codebook, not of the two-head design.
+\item[H-D (surprisal as reward).] Masked-unit surprisal of a boundary-aligned model pretrained on real human motion/appearance trajectories localises artefact intervals in generated video with event-\Fone{} at $\tau$=0.2\,s above a forecasting-surprisal baseline (Timestral-209M) and above frame-wise VLM scores aggregated over time.
+\end{description}
+
+\section{Method: self-iterated boundary units}
+\paragraph{Iteration 0.} Pretrain as in the pilot (data2vec or km(teacher) on the Gemma-style block). Fine-tune an onset/offset head on the labelled development split only (few hundred events). Run the head over the unlabelled corpus to obtain a boundary posterior $b_t$.
+\paragraph{Gate.} On the labelled split compute $P(\text{start}\mid\text{boundary})$ and the start rate of the segmentation induced by thresholding $b_t$; accept only if alignment $\ge0.6$ at rate $\le0.15$. If the gate fails, the iteration stops and the failure is recorded, exactly as in the pilot.
+\paragraph{Iteration $k$.} Segment the corpus with $b_t$; average student features within segments; $k$-means ($K$=100--500) on segment means; broadcast segment units to tokens; retrain with cross-entropy on units at masked positions plus binary cross-entropy on segment starts (positive weight 3). Re-estimate $b_t$ from the new student and repeat. Stop when alignment and \Fone{}$_{\tau=.05}$ plateau.
+\paragraph{Variants to compare.} (i) hard segment units vs soft (posterior-weighted) units; (ii) with and without the fine 20\,ms codebook (H-C); (iii) boundary head trained on the student's own iteration-0 units (fully unsupervised, SD-HuBERT-like) vs calibrated on $\le$100 labelled events; (iv) multi-resolution units (MR-HuBERT style) as a baseline.
+
+\section{Application: a dense temporal judge for generated video}
+\paragraph{Problem.} VLM judges score frames; FVD-style metrics score clips; artefacts on hands and teeth live in time (a finger appears for 300\,ms, teeth shimmer between frames). Reinforcement-learning fine-tuning of video generators needs a reward that is localised in time and cheap.
+\paragraph{Input series.} Per frame at 25--30\,Hz: hand keypoints (2$\times$21$\times$3, RTMPose/MediaPipe), face landmarks with emphasis on the inner mouth, DINOv2/SigLIP embeddings of hand and mouth crops, optical-flow statistics. One multichannel series; the same linear front-end as telemetry.
+\paragraph{Pretraining.} Only on real humans (VoxCeleb2/HDTF for faces, Ego4D/HO3D/InterHand for hands), boundary-aligned units from \S3.
+\paragraph{Scoring.} Per-frame anomaly $a_t$ from (a) masked-unit loss, (b) unit-transition rarity, (c) distance to the nearest centroid; two-threshold decoding into events (class: hand / mouth / teeth); event-\Fone{}$(\tau)$ against human-annotated artefact intervals (100--200 clips, 2--3\,min each to annotate). Reward for a segment is $-\bar a_t$; used in GRPO/DPO for Wan-2.1-class and talking-head generators available locally.
+\paragraph{Baselines.} Timestral-209M forecasting surprisal on the same series; frame-wise VLM score aggregated over time; KiMoI-style supervised kinematic detectors; VidGuard-R1 / Skyra as clip-level judges.
+\paragraph{Control.} Real videos under poor lighting and motion blur, where pose detectors also fail, to verify that surprisal responds to generation artefacts and not to difficult capture.
+
+\section{Experimental plan and gates}
+\begin{enumerate}\setlength{\itemsep}{1pt}
+\item Synthetic alignment sweep for H-A on the whale mixtures (alignment controlled by construction): 1 day.
+\item Iteration-0 onset head and gate on Avacha and BeamNG: 2 days. Stop if gate fails on both.
+\item Two self-iterations, three seeds, frozen probe and full FT, bootstrap over recordings: 1 week.
+\item H-C hierarchy ablation: 3 days.
+\item Video domain: feature extraction pipeline (1 week), annotation of 150 clips (1 week, parallel), pretraining and scoring (1 week), reward integration (2 weeks). \todo{owner}
+\end{enumerate}
+Every run is recorded with fingerprint, code snapshot and verdict in \texttt{expdb}; a hypothesis is closed only by a verdict with run ids.
+
+\section{Risks}
+Self-iteration can lock in the student's own errors (confirmation); the gate and the labelled calibration split exist to catch this. Boundary posteriors on telemetry may be dominated by control discontinuities (gear shifts) rather than events of interest; per-class gates are needed. For video, pose detectors fail on exactly the frames we care about; the control set addresses this, but the signal may remain entangled with detector failure. The audio domain is limited to one species and 74 labelled minutes; EEG (Sleep-EDF, CHB-MIT) is the planned third domain for the companion paper and a fourth here.
+
+\section{Expected contribution}
+A pretext task whose ``where'' component is tied to event boundaries by construction, with an admission test that prevents the failure mode we measured; a demonstration that the resulting surprisal is a usable dense reward for video generation. If H-B fails after two iterations on two domains, the negative result, with the gate statistics, is itself the contribution: masked unit prediction cannot be made boundary-aware without labels.
+
+\end{document}

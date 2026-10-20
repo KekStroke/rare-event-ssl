@@ -1,0 +1,28 @@
+{
+ "kmmel_synth": {
+  "purity": 0.639,
+  "pnmi": 0.149,
+  "switch_at_boundary": 0.575,
+  "switch_inside": 0.423,
+  "switch_overall": 0.43,
+  "n_tokens": 500000
+ },
+ "kmaves_synth": {
+  "purity": 0.685,
+  "pnmi": 0.272,
+  "switch_at_boundary": 0.577,
+  "switch_inside": 0.454,
+  "switch_overall": 0.46,
+  "n_tokens": 498000
+ },
+ "kmaves_field": {
+  "purity": 0.905,
+  "pnmi": 0.44,
+  "switch_at_boundary": 0.574,
+  "switch_inside": 0.515,
+  "switch_overall": 0.516,
+  "n_tokens": 219822,
+  "call_token_frac": 0.117
+ },
+ "majority_share_field": 0.883
+}
