@@ -1,0 +1,7 @@
+# versions used for every run in expdb/expdb.sqlite (RTX 5090 Laptop, CUDA 12.8, Python 3.14)
+torch==2.11.0
+torchaudio==2.11.0
+numpy==2.5.4
+scipy==1.18.1
+tqdm==4.70.1
+sed_eval==0.2.1   # voxaboxen_eval.py only (sed_eval cross-check)

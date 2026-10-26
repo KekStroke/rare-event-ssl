@@ -1,0 +1,246 @@
+\documentclass[10pt,twocolumn]{article}
+\usepackage[a4paper,margin=18mm,columnsep=6mm]{geometry}
+\usepackage{booktabs,graphicx,amsmath,amssymb,hyperref}
+\usepackage[numbers,sort&compress]{natbib}
+\newcommand{\Fone}{F$_1$}
+\newcommand{\ci}[3]{$#1$\,[$#2$,$#3$]}
+\title{A Compact Single-Pass Detector of Overlapping Killer-Whale Calls\\Trained on Synthetic-Mixture Labels: What the Components Contribute}
+\author{Iaroslav Sheipak$^{1}$ and co-authors \\[2pt] \small $^1$MIPT}
+\date{Draft v0.7 --- 26 October 2026}
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We describe a compact (17.8M-parameter) single-direction detector of killer-whale calls. It predicts presence, onset probability and log-duration per 20\,ms token, learns this task already during pretraining from synthetic mixtures whose event positions are known by construction, is fine-tuned on field labels, and is decoded by onset-peak picking with overlapping instances allowed and no box suppression. On 17 field recordings with 613 expert calls, 119 of which overlap another call, we measure with three seeds per cell and paired bootstrap over recordings what each component contributes to class-agnostic recall at matched false-alarm rate. Pretraining the event branch instead of adding it at fine-tuning gives $+0.066$ [$+0.038$, $+0.096$] recall at 100 false alarms per hour; a masked-unit objective on top of it adds nothing detectable. Decoding instances from the event outputs instead of segments from the frame-wise track of the same model gives $+0.157$ [$+0.082$, $+0.238$] overall and $+0.415$ [$+0.278$, $+0.511$] on overlapping calls. Removing overlaps from the synthetic pretraining corpus costs about 11 recall points on overlapping calls at every matched false-alarm rate while the frame-wise track of the same models does not degrade: on this corpus the overlap gain enters through the event pathway. Against Voxaboxen (BEATs, 90M) fine-tuned on the same field folds, the detector is ahead at 61 and 100 false alarms per hour ($+0.141$ [$+0.053$, $+0.247$], $+0.095$ [$+0.010$, $+0.184$]) and the comparison is unresolved at 150 and 300. On the public Overlapping Zebra Finch data, with 5.5k training calls, the overlap effect is not found, and the six-times smaller detector gives recall close to Voxaboxen's at matched false-alarm rate, with no established difference, while scoring lower in mAP at IoU 0.8.
+\end{abstract}
+
+\section{Introduction}
+A biologist reviewing detector output on killer-whale field recordings asks one question of it: at a false-alarm load they can tolerate, how many of the calls does it find? Two features of these recordings make the answer hard. Calls come in dense bouts, so consecutive annotations frequently abut or overlap; and because the review is done by a person, a detection that merges two calls into one event counts as a miss for the second call. In a companion study~\citep{sheipak2026what} we decomposed the misses of frame-wise detectors under a strict event scorer: 81\% of boundary failures and all absorptions have a neighbouring reference within 0.3\,s. The dominant loss is not sensitivity but the inability of a frame-wise track to represent two calls at once.
+
+Onset-based detectors address exactly this. Voxaboxen~\citep{mahon2025voxaboxen} predicts an onset probability and a duration per frame from a BEATs encoder~\citep{chen2023beats} in both time directions, trains on synthetic recordings with controlled overlap, and merges the two directions. We adopt the same task formulation (presence, onset, duration) and ask a narrower question with a controlled study: in a compact single-pass detector, which components move the annotator's criterion, and by how much?
+
+\paragraph{Contributions.}
+\begin{itemize}\setlength{\itemsep}{1pt}
+\item A 17.8M-parameter single-direction instance detector: one event branch, pretrained with event supervision on target-domain synthetic mixtures, decoded by onset-peak picking without box NMS and without a backward pass (Section~\ref{sec:method}).
+\item A controlled component study on 613 expert calls, three seeds per cell, paired recording-level bootstrap (Section~\ref{sec:results}). Pretraining the event branch on construction labels is worth $+0.066$ recall at 100 FA/h (C1); the masked-unit objective adds nothing detectable (C2); the event pathway with instance decoding is the largest single effect, $+0.415$ on overlapping calls (C3); the encoder block configuration matters (C4).
+\item The finding that, on the whale corpus, the gain on overlapping calls depends on overlap in the synthetic pretraining corpus and is carried by the event pathway, not by the frame-wise track of the same network (C6), together with its non-replication on a second species with abundant labels (Section~\ref{sec:ozf}).
+\item A comparison with Voxaboxen under one protocol and equal access to field labels (C5): ahead at 61 and 100 FA/h on the whale data and unresolved above; close recall and lower mAP at IoU 0.8 on zebra finch.
+\end{itemize}
+The task formulation, synthetic overlaps and construction labels are Voxaboxen's and those of~\citet{hoffman2025synthetic}. Our contribution is the measurement of what they are worth in a compact single-pass detector, not the components themselves.
+
+\section{Related work}
+\paragraph{Onset-based and box-based sound event detection.} YOHO~\citep{venkatesh2022yoho} regresses event boxes YOLO-style; sound event bounding boxes~\citep{ebbers2024sebbs} post-process frame posteriors into boxes with a change-point criterion; Voxaboxen~\citep{mahon2025voxaboxen} is the closest method, with per-frame onset probability and duration regression, forward and backward passes, soft-NMS within each direction and bipartite merging of the two. Voxaboxen's own ablation shows that forward-only prediction (one direction, as in our detector) costs 1--2 mAP points on most of its datasets and more on some; soft-NMS is not ablated there. Our decoder keeps only the first half of that pipeline (peaks of an onset posterior, duration from a regression output) and has no NMS of boxes. The cost of the dropped backward pass and matching under our criterion is unmeasured, since we did not implement them, and the minimum peak distance of our decoder is itself a suppression of close onsets (Section~\ref{sec:method}).
+\paragraph{Synthetic training data.} Training strongly labelled sound event detectors on synthesised soundscapes whose event boundaries are known by construction has been standard since Scaper~\citep{salamon2017scaper} and the DESED synthetic set~\citep{turpault2019desed}; in bioacoustics, \citet{hoffman2025synthetic} train a context-aware detector on synthetic scenes with automatically generated labels, and Voxaboxen builds six synthetic zebra-finch sets with a controlled overlap-to-call ratio, on which it degrades only slightly as overlap grows while frame-based detectors degrade sharply. Those sets serve to evaluate detectors under controlled overlap; we did not find a measurement of how the overlap fraction of the synthetic \emph{training} data changes recall on overlapping \emph{field} calls, which is what C6 measures on one corpus.
+\paragraph{Self-supervised encoders.} HuBERT~\citep{hsu2021hubert}, AVES~\citep{hagiwara2023aves} and BEATs~\citep{chen2023beats} supply the encoders of most recent bioacoustic detectors. In~\citep{sheipak2026what} we measured, on the same recordings, that compact students pretrained with HuBERT-style targets reach class-aware event \Fone{} comparable to a fine-tuned 94M teacher but trail it on screening recall; here the unit objective is kept as a controlled factor.
+\paragraph{Metrics.} The event scorer is the collar-based one of~\citep{mesaros2016metrics}; the operating criterion, recall at a false-alarm budget with development-selected thresholds, follows~\citep{sheipak2026mmb,sheipak2026what}.
+
+\section{Task, metric and protocol}
+\label{sec:protocol}
+\paragraph{Data.} 17 continuous recordings (74\,min, Avacha Gulf, 48\,kHz, resampled to 16\,kHz) with 613 expert-annotated calls of 11 types. A reference is \emph{overlapping} if its annotation interval intersects another reference; 119 references (19\%) are overlapping, 494 isolated. Pretraining uses 45{,}429 isolated lab clips (11.15\,h, of which 12{,}228 noise clips) and no field audio.
+\paragraph{Scorer.} Class-agnostic strict matching: a prediction matches a reference if $|\hat s-s|\le\tau$ and $|\hat e-e|\le\max(\tau,0.5(e-s))$ with $\tau$=0.5\,s, greedy onset-nearest, one prediction per reference. A false alarm is an unmatched prediction; the false-alarm rate (FAR) is false alarms per hour of test audio. We also report coverage recall (at least 50\% of the reference covered by some prediction), which is what a reviewer would see.
+\paragraph{Two readings of every system.} The \emph{operating point} is the deployable system: three recording-held-out folds (6/6/5 recordings), the first recording of each of the two training folds as the development set, decoder parameters chosen on the two development recordings as the setting with the highest recall whose development FAR does not exceed 100 per hour, test recall and the \emph{actual} test FAR pooled over folds. Thresholds transfer imperfectly from two recordings, so operating points of different systems land at different test FARs (70--130 per hour in Table~\ref{tab:main}) and are not directly comparable. The \emph{matched-FAR reading} is an evaluation characteristic, not a deployable system, because its threshold is placed using test labels: the main decoder threshold is swept (down to 0.005) with the fold-wise development-chosen secondary parameters fixed, true positives and predictions are summed over seeds and recordings, and recall is read off the pooled test curve at 61.4, 100 and 150 false alarms per hour (61.4 is the maximal FAR reachable from Voxaboxen's stored synthetic-only predictions; 300 is reported only where every system in the comparison reaches it). Subset recall (overlapping or isolated references) is read at the same \emph{global} FAR, computed from all predictions of the recording set, not from a subset-specific false-alarm count. Both readings are reported side by side.\footnote{The two readings are different aggregates of the same runs and need not agree: for R2 minus R1 the seed-mean difference of operating-point recall is 0.072 and the bootstrap difference at matched FAR 100 is 0.066. The operating points sit at different test FARs (106 against 90), while the matched-FAR curve pools true positives and predictions over seeds and recordings before interpolation, and the bootstrap mean differs from the full-data value by its bias. The curve grid extends to threshold 0.005 so that fewer than 1\% of resamples are undefined at 100 FA/h for the main regimes.}
+\paragraph{Intervals and seed spread.} Main cells have three pretraining seeds, each fine-tuned and decoded independently; the seed spread of operating points is reported separately (Table~\ref{tab:seeds}). Paired differences carry 95\% bootstrap intervals over the 17 recordings (2000 resamples) in which the recording is the resampling unit and carries the predictions of all its seeds jointly, so the three models of a cell are treated as a fixed ensemble of outputs. The intervals therefore quantify uncertainty over recordings conditional on the trained models; they do not separately estimate the uncertainty of training itself, for which the seed spread is the only evidence. Resamples whose curve does not reach the matching FAR are excluded; a comparison is reported only where at least 80\% of resamples are defined, and the share is given where it is below 95\%.
+
+\section{The detector}
+\label{sec:method}
+\paragraph{Synthetic construction.} Each 5\,s pretraining example with index $i$ is a deterministic mixture: a background of cross-faded noise clips (50\,ms cross-fade, gain $U(0.5,1)$) and one to four lab calls, each with 20\,ms fades, gain $U(0.4,1.6)$ and a uniformly random start; clips may overlap freely. On 1500 mixtures: 2.51 calls per mixture, 38\% call time, and 57\% of calls overlap another call (a call counts as overlapping if its interval intersects another call's). Because every call's start and end are known, each mixture carries three token-level targets: presence (a call covers the token), onset (tokens within $\pm$1 of a call start) and log-duration at the onset tokens. A no-overlap variant used in one ablation keeps the same clip identities, gains and call-count draws per mixture index, draws positions from a separate random stream so that calls fall only in free segments with a gap of at least 0.1\,s, and drops calls that do not fit (2.38 calls per mixture, 44\% call time, 0\% overlapping); the two corpora thus differ not only in overlap but also slightly in call count and call density. The default corpus is bit-identical to the one used in~\citep{sheipak2026what}.
+\paragraph{Encoder.} 80-bin log-mel at 10\,ms hop, stacked in pairs to 20\,ms tokens. \emph{Modern}: 8 layers, $d$=384, RMSNorm, GeGLU, RoPE, QK-norm, local (64-token) and global attention alternating 3:1, a gated-convolution module per layer; 17.8M parameters. \emph{Vanilla} (one ablation): 8 pre-norm layers, $d$=384, 6 heads, FFN 1536, convolutional positional embedding; 14.8M.
+\paragraph{Event branch and pretraining regimes.} A linear layer on the last encoder layer outputs presence, onset and log-duration logits per token. Its loss is binary cross-entropy on presence, binary cross-entropy on onset with positive weight 10, and 0.5 times the L1 error of log-duration at onset tokens. Three regimes share everything else (span masking with start probability 0.08 and span 10, 20k steps of batch 32$\times$5\,s, AdamW, peak learning rate $5\cdot10^{-4}$, 1.5k warm-up steps, cosine decay, about 30 minutes on one RTX 5090 laptop GPU): \textbf{R1} masked prediction of $k$-means units ($K$=100) of layer-9 AVES-bio features, no event branch (the branch is added at fine-tuning with random initialisation); \textbf{R2} units plus the event branch; \textbf{R3} the event branch only, with the unit loss removed. R3 is supervised pretraining on construction labels, not self-supervised learning.
+\paragraph{Fine-tuning.} 1.5k steps of batch 8$\times$10\,s on the training recordings of the fold, encoder learning rate $5\cdot10^{-5}$, head learning rate $10^{-3}$, 100-step warm-up and cosine decay. The loss is a class-weighted 12-way cross-entropy (11 call types and noise) plus the same event losses computed from the field annotations; the event branch is initialised from the pretraining checkpoint when it exists. The field annotations contain overlapping calls, so every regime, including the no-overlap ablation, sees overlaps at this stage.
+\paragraph{Instance decoder.} Peaks of the onset posterior with height at least $\theta_{\mathrm{on}}$ and minimum distance $d_{\min}$; each peak starts an instance whose length is $\exp$ of the log-duration output at the peak, clipped to [0.15, 5]\,s; the instance score is the onset probability times the mean presence inside it, and instances below a minimum score are dropped; the class is the argmax of the summed call probabilities inside. Instances may overlap; there is no IoU-based suppression of boxes and no second pass. The minimum peak distance $d_{\min}$ does suppress onsets closer than $d_{\min}$ to a stronger peak, and the development selection sets it to 0.2--0.7\,s under the false-alarm budget although 0.1\,s is in the grid. The three parameters are chosen per fold on the development recordings from $\theta_{\mathrm{on}}\in\{0.1,\dots,0.8\}$, $d_{\min}\in\{0.1,0.2,0.3,0.5\}$\,s and minimum score $\in\{0,0.1,0.2,0.3\}$; the matched-FAR curve sweeps $\theta_{\mathrm{on}}$.
+\paragraph{Frame decoder (baseline on the same model).} $p_{\mathrm{call}}=1-p_{\mathrm{noise}}$ from the class head, median filter of 5 tokens, two thresholds (detect, edge) chosen on the development recordings, minimum duration 0.15\,s. It reads a different output of the same network and cannot represent two simultaneous calls; a comparison between the two decoders therefore measures the event-prediction pathway together with its decoding, not the decoding algorithm alone.
+
+\section{Results}
+\label{sec:results}
+
+\begin{table*}[t]
+\centering
+\caption{All systems under one protocol: 17 recordings, 613 references, strict class-agnostic recall ($\tau$=0.5\,s). Operating point: decoder parameters chosen on development recordings for a budget of 100 FA/h, with the actual test FAR; ``overlapping'' is recall on the 119 overlapping references at that operating point (different FARs; Table~\ref{tab:overlap} gives matched FAR). R@$F$: recall read off the pooled test curve at a global FAR of $F$ per hour. Our models: three seeds pooled; Voxaboxen: one model per fold. ``---'': curve does not reach that FAR.}
+\label{tab:main}
+\setlength{\tabcolsep}{4pt}\footnotesize
+\resizebox{\textwidth}{!}{\begin{tabular}{llrccccccc}
+\toprule
+System & encoder & params & op.\ recall / FAR & overlapping & coverage & R@61 & R@100 & R@150 & R@300\\
+\midrule
+Voxaboxen, synthetic-only (stored boxes $\ge$0.5) & BEATs & 90M & 0.697 / 43 & 0.437 & --- & 0.816 & --- & --- & ---\\
+Voxaboxen, field FT, best-validation checkpoint & BEATs & 90M & 0.685 / 76 & 0.445 & 0.737 & 0.653 & 0.764 & 0.842 & 0.935\\
+Voxaboxen, field FT, staff pipeline (last epoch) & BEATs & 90M & 0.773 / 91 & 0.479 & 0.830 & 0.695 & 0.790 & 0.868 & 0.945\\
+\midrule
+R1 units, branch at FT, frame decoder & modern & 17.8M & 0.685 / 70 & 0.235 & --- & 0.675 & 0.694 & 0.697 & 0.707\\
+R1 units, branch at FT, instance decoder & modern & 17.8M & 0.799 / 90 & 0.638 & 0.853 & 0.778 & 0.802 & 0.807 & 0.813\\
+R3 branch only, vanilla block & vanilla & 14.8M & 0.827 / 101 & 0.641 & --- & 0.792 & 0.844 & 0.853 & ---\\
+R3 branch only, no-overlap synthetic corpus & modern & 17.8M & 0.847 / 111 & 0.608 & --- & 0.810 & 0.854 & 0.872 & ---\\
+R2 units + branch & modern & 17.8M & 0.871 / 106 & 0.723 & 0.917 & 0.847 & 0.870 & 0.875 & ---\\
+R3 branch only & modern & 17.8M & 0.887 / 128 & 0.709 & 0.938 & 0.849 & 0.885 & 0.903 & 0.918\\
+\bottomrule
+\end{tabular}}
+\end{table*}
+
+\begin{table}[t]
+\centering\footnotesize
+\caption{Recall on the 119 overlapping references at matched global FAR 61.4 and 100 (pooled test curves). Frame decoders of R1--R3 lie at 0.25--0.28 at 100 FA/h.}
+\label{tab:overlap}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcc}
+\toprule
+System & ovl.\ R@61 & ovl.\ R@100\\
+\midrule
+Voxaboxen, synthetic-only & 0.462 & ---\\
+Voxaboxen, field FT, best-val & 0.352 & 0.511\\
+Voxaboxen, field FT, staff & 0.371 & 0.497\\
+R1 instance & 0.572 & 0.648\\
+R3 no-overlap corpus & 0.518 & 0.600\\
+R2 instance & 0.656 & 0.718\\
+R3 instance & 0.633 & 0.708\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering\footnotesize
+\caption{Seed spread: operating-point recall / test FAR / recall on overlapping references at the operating point, per pretraining seed (instance decoder).}
+\label{tab:seeds}
+\setlength{\tabcolsep}{3pt}
+\resizebox{\columnwidth}{!}{\begin{tabular}{lccc}
+\toprule
+Regime & seed 0 & seed 1 & seed 2\\
+\midrule
+R1 & 0.803 / 86 / 0.630 & 0.801 / 102 / 0.655 & 0.793 / 83 / 0.630\\
+R2 & 0.874 / 86 / 0.723 & 0.881 / 108 / 0.706 & 0.858 / 125 / 0.739\\
+R3 & 0.905 / 132 / 0.714 & 0.902 / 152 / 0.765 & 0.853 / 101 / 0.647\\
+R3 vanilla & 0.869 / 146 / 0.731 & 0.825 / 82 / 0.613 & 0.786 / 75 / 0.580\\
+R3 no-overlap & 0.876 / 135 / 0.672 & 0.840 / 75 / 0.563 & 0.825 / 122 / 0.588\\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\begin{table*}[t]
+\centering\footnotesize
+\caption{Within-system ablations: paired differences (first minus second), recording-level bootstrap with all seeds carried by the recording, 2000 resamples, 95\% intervals, conditional on the trained models. ``op'': difference of operating-point recall (different FARs). Overlap and isolated columns are subset recall at matched global FAR 100. $^{a}$ defined in 81--91\% of resamples; $^{b}$ at the operating points; $^{c}$ fewer than 80\% of resamples defined, not reported.}
+\label{tab:abl}
+\setlength{\tabcolsep}{3pt}
+\resizebox{\textwidth}{!}{\begin{tabular}{llcccccc}
+\toprule
+Claim & Comparison & $\Delta$op & $\Delta$R@61 & $\Delta$R@100 & $\Delta$R@150 & $\Delta$overlap@100 & $\Delta$isolated@100\\
+\midrule
+C1 & R2 $-$ R1 (instance) & \ci{+.072}{+.043}{+.103} & \ci{+.063}{+.017}{+.101} & \ci{+.066}{+.038}{+.096} & \ci{+.067}{+.040}{+.095}$^{a}$ & \ci{+.068}{+.025}{+.112} & ---\\
+C2 & R3 $-$ R2 (instance) & \ci{+.016}{-.002}{+.033} & \ci{-.000}{-.052}{+.035} & \ci{+.019}{-.004}{+.042} & \ci{+.026}{+.005}{+.045}$^{a}$ & \ci{-.003}{-.046}{+.041} & ---\\
+C3 & R2 instance $-$ R2 frame & \ci{+.171}{+.089}{+.268} & ---$^{c}$ & \ci{+.157}{+.082}{+.238} & \ci{+.173}{+.094}{+.260}$^{a}$ & \ci{+.415}{+.278}{+.511} & ---\\
+C3 & R3 instance $-$ R3 frame & \ci{+.171}{+.097}{+.264} & ---$^{c}$ & \ci{+.155}{+.094}{+.227} & \ci{+.172}{+.100}{+.255} & \ci{+.422}{+.273}{+.528} & \ci{+.092}{+.059}{+.134}\\
+C4 & R3 vanilla $-$ R3 modern & \ci{-.060}{-.079}{-.039} & \ci{-.061}{-.162}{+.001} & \ci{-.050}{-.114}{-.018}$^{a}$ & ---$^{c}$ & \ci{-.068}{-.103}{-.036}$^{b}$ & ---\\
+C4 & same, frame decoder & \ci{-.021}{-.037}{-.005} & ---$^{c}$ & \ci{-.021}{-.043}{+.000} & \ci{-.017}{-.036}{+.002} & \ci{-.002}{-.054}{+.055}$^{b}$ & ---\\
+C6 & R3 no-overlap $-$ R3 (instance) & \ci{-.040}{-.052}{-.027} & \ci{-.035}{-.075}{-.001} & \ci{-.033}{-.066}{-.010} & \ci{-.031}{-.056}{-.011} & \ci{-.110}{-.169}{-.057} & \ci{-.015}{-.042}{+.004}\\
+C6 & same, frame decoder & \ci{+.042}{+.014}{+.075} & ---$^{c}$ & \ci{+.038}{+.010}{+.069} & \ci{+.043}{+.014}{+.076} & \ci{+.042}{-.022}{+.088} & \ci{+.036}{+.008}{+.067}\\
+\bottomrule
+\end{tabular}}
+\end{table*}
+
+\begin{table*}[t]
+\centering\footnotesize
+\caption{Comparison with Voxaboxen (C5) at 61, 100, 150 and 300 FA/h: paired differences, same bootstrap as Table~\ref{tab:abl}. Voxaboxen has one model per fold. $^{b}$ at 61 FA/h, the highest load reachable from the synthetic-only checkpoint's stored predictions.}
+\label{tab:vox}
+\setlength{\tabcolsep}{3pt}
+\resizebox{\textwidth}{!}{\begin{tabular}{lcccccc}
+\toprule
+Comparison & $\Delta$op & $\Delta$R@61 & $\Delta$R@100 & $\Delta$R@150 & $\Delta$R@300 & $\Delta$overlap@100\\
+\midrule
+R3 $-$ Vox field FT (staff) & \ci{+.112}{+.063}{+.153} & \ci{+.141}{+.053}{+.247} & \ci{+.095}{+.010}{+.184} & \ci{+.038}{-.034}{+.128} & \ci{-.024}{-.058}{+.019} & \ci{+.195}{+.020}{+.304}\\
+R2 $-$ Vox field FT (staff) & \ci{+.096}{+.050}{+.135} & \ci{+.142}{+.046}{+.262} & \ci{+.076}{-.014}{+.176} & \ci{+.019}{-.059}{+.112} & --- & \ci{+.200}{+.025}{+.309}\\
+R1 $-$ Vox field FT (staff) & \ci{+.023}{-.033}{+.073} & \ci{+.079}{-.020}{+.191} & \ci{+.009}{-.091}{+.108} & \ci{-.057}{-.144}{+.047} & \ci{-.121}{-.174}{-.062} & \ci{+.130}{-.049}{+.236}\\
+R3 $-$ Vox field FT (best-val) & \ci{+.199}{+.147}{+.252} & \ci{+.184}{+.101}{+.273} & \ci{+.119}{+.043}{+.204} & \ci{+.059}{-.014}{+.134} & \ci{-.013}{-.055}{+.048} & \ci{+.187}{+.055}{+.320}\\
+R3 $-$ Vox synthetic-only & \ci{+.187}{+.121}{+.250} & \ci{+.039}{-.051}{+.150} & --- & --- & --- & \ci{+.160}{+.060}{+.248}$^{b}$\\
+Vox field FT (staff) $-$ Vox synthetic-only & \ci{+.076}{+.039}{+.110} & \ci{-.121}{-.204}{-.044} & --- & --- & --- & \ci{-.105}{-.200}{-.017}$^{b}$\\
+Vox field FT (best-val) $-$ (staff) & \ci{-.087}{-.118}{-.058} & \ci{-.043}{-.089}{+.001} & \ci{-.024}{-.057}{+.006} & \ci{-.021}{-.041}{+.008} & \ci{-.011}{-.037}{+.002} & \ci{+.008}{-.074}{+.087}\\
+\bottomrule
+\end{tabular}}
+\end{table*}
+
+Table~\ref{tab:main} lists every system under the one protocol at the operating point and at 61, 100, 150 and 300 FA/h; Table~\ref{tab:overlap} gives recall on the overlapping references at matched FAR, Table~\ref{tab:seeds} the seed spread, Table~\ref{tab:abl} the within-system ablations and Table~\ref{tab:vox} the comparison with Voxaboxen. Operating points of R2 and R3 overshoot the development budget (106 and 128 test FA/h against 100), which is why the matched-FAR columns, not the operating points, carry the claims.
+
+\subsection{C1: pretraining the event branch beats adding it at fine-tuning}
+R1 and R2 share the encoder, the unit objective, the fine-tuning recipe (including the event losses) and the decoder; they differ only in whether the event branch exists during pretraining. The difference is $+0.066$ [$+0.038$, $+0.096$] recall at 100 FA/h, of the same size at 61 and 150, and $+0.068$ [$+0.025$, $+0.112$] on overlapping calls at 100 FA/h. The sign holds in every seed (Table~\ref{tab:seeds}: 0.793--0.803 against 0.858--0.881 at the operating points). The branch learns something from construction labels that 1.5k steps on field labels do not supply.
+
+\subsection{C2: no additional benefit of the masked-unit objective is detected}
+R3 removes the unit loss from R2. The differences are $+0.019$ [$-0.004$, $+0.042$] at 100 FA/h, $-0.000$ [$-0.052$, $+0.035$] at 61, $+0.026$ [$+0.005$, $+0.045$] at 150 (81\% of resamples defined), and $-0.003$ [$-0.046$, $+0.041$] on overlapping calls. The intervals do not exclude a small benefit of the unit objective at 61 FA/h, nor a small cost of it at 150; what they exclude is a benefit of the size of C1. In this protocol the event-only regime can be preferred for simplicity. This says nothing about unit prediction in general.
+
+\subsection{C3: the event pathway with instance decoding is the largest single effect}
+On the same fine-tuned R2 models, decoding instances from the event outputs instead of segments from the frame-wise class track gives $+0.157$ [$+0.082$, $+0.238$] at 100 FA/h and $+0.415$ [$+0.278$, $+0.511$] on overlapping calls (0.275 to 0.718); R3 behaves the same, with $+0.092$ [$+0.059$, $+0.134$] on isolated calls. The two decoders read different outputs of one network, so this measures the event-prediction pathway together with its decoding; it does not isolate the decoding algorithm, and it does not show that the absence of box NMS is beneficial.
+
+\subsection{C4: the modern block configuration matters for the event detector}
+R3 on the vanilla block is below R3 on the modern block in every seed (Table~\ref{tab:seeds}): $-0.050$ [$-0.114$, $-0.018$] at 100 FA/h (81\% defined), $-0.068$ [$-0.103$, $-0.036$] on overlapping calls at the operating points; at 61 FA/h the interval touches zero ($-0.061$ [$-0.162$, $+0.001$]). With the frame decoder the gap is $-0.021$ [$-0.043$, $+0.000$], and in~\citep{sheipak2026what} the same block change moved frame-wise detection on unit targets by $+0.011$. The effect belongs to the whole configuration, including 17.8M against 14.8M parameters; components were not attributed.
+
+\subsection{C5: against Voxaboxen under equal access to field labels}
+\label{sec:vox}
+Protocol (Appendix~\ref{app:vox}): Voxaboxen 0.2.0 with its BEATs encoder, started from the detector trained on synthetic data in April 2026, fine-tuned per fold on the same training recordings with the development recordings held out, staff inference with detection threshold 0.05 and combination discard 0, so that one threshold on the Detection Probability of the combined boxes reproduces the staff decoder at that discard value; operating point and curves scored exactly as for our models. Three variants are reported: the synthetic-only checkpoint (stored predictions, available from threshold 0.5, hence up to 61 FA/h), the field-fine-tuned model as the staff pipeline returns it (last epoch), and a field-fine-tuned model with the checkpoint of best validation combined \Fone{} (local patch). The best-validation variant is below the last-epoch variant at every FAR (Table~\ref{tab:vox}), so the stronger one carries the comparison.
+
+The outcome depends on the false-alarm load (Table~\ref{tab:vox}). At 61 and 100 FA/h the detector is ahead of the staff field-fine-tuned Voxaboxen: $+0.141$ [$+0.053$, $+0.247$] and $+0.095$ [$+0.010$, $+0.184$]. At 150 and 300 the intervals contain zero ($+0.038$ [$-0.034$, $+0.128$], $-0.024$ [$-0.058$, $+0.019$]): the comparison there is unresolved, not a tie. On overlapping calls at matched FAR the difference is $+0.195$ [$+0.020$, $+0.304$] at 100 FA/h and $+0.248$ [$+0.139$, $+0.352$] at 61 (0.633 against 0.371). R1, the regime without a pretrained branch, is not ahead of field-fine-tuned Voxaboxen at 100 FA/h ($+0.009$ [$-0.091$, $+0.108$]) and is behind at 300 ($-0.121$ [$-0.174$, $-0.062$]): against this baseline it is the pretrained branch that makes the difference, not instance decoding alone. Coverage recall at the operating points is 0.938 (R3) against 0.830.
+
+Two facts limit the claim. First, field fine-tuning lowered Voxaboxen below its own synthetic-only checkpoint at 61 FA/h ($-0.121$ [$-0.204$, $-0.044$]) while raising its curve at high loads to 0.945; the package's early stopping acts on training loss and its validation criterion is an \Fone{}, neither of which targets recall at low FAR, and we did not search for a fine-tuning regime of Voxaboxen that would. The comparison is therefore with the configuration we tested, with its staff hyperparameters and one model per fold. Second, against the synthetic-only checkpoint in its own operating range the overall difference is unresolved ($+0.039$ [$-0.051$, $+0.150$] at 61 FA/h), although on overlapping calls it is not ($+0.160$ [$+0.060$, $+0.248$]). We do not claim superiority over Voxaboxen as a method.
+
+\subsection{C6: the gain on overlapping calls depends on overlap in the synthetic pretraining corpus}
+\label{sec:noov}
+R3 pretrained on the no-overlap corpus and fine-tuned identically loses about 11 points of recall on overlapping calls at every matched FAR ($-0.110$ [$-0.169$, $-0.057$] at 100; $-0.110$ [$-0.154$, $-0.058$] at 61; $-0.109$ [$-0.170$, $-0.064$] at 150) and $0.033$ [$0.010$, $0.066$] overall at 100 FA/h. On isolated calls no convincing difference is detected ($-0.015$ [$-0.042$, $+0.004$]; the interval allows a loss of up to four points). The frame-wise track of the same models does not degrade on the no-overlap corpus; it is slightly better ($+0.038$ [$+0.010$, $+0.069$] at 100 FA/h). The two prediction pathways of one network thus respond in opposite directions to the same change of training data. This does not show that the representation is unaffected, only that its frame-wise reading is not worse while its event reading loses the separation of neighbouring calls. Descriptively, the advantage of instance decoding over the frame decoder on overlapping calls is $+0.270$ [$+0.160$, $+0.366$] on the no-overlap corpus against $+0.422$ [$+0.273$, $+0.528$] on the default corpus, but both terms of that advantage move, and the corpora differ slightly in call count and density, so we do not offer a causal split of the overlap gain into a synthetic-data part and a decoder part. The result locates the source of our gain on overlapping calls; the construction itself is Voxaboxen's, which also trains on overlap-rich synthetic sets.
+
+\subsection{Transfer to a second species: Overlapping Zebra Finch}
+\label{sec:ozf}
+To test whether C6 is a property of the method or of the whale corpus, we repeated the paired comparison on the public Overlapping Zebra Finch data (OZF; 65 one-minute recordings, 8{,}504 calls of median duration 106\,ms, 31\% overlapping by our definition)~\citep{mahon2025voxaboxen}, with the protocol fixed before any training. Official split (46 train / 6 validation / 13 test recordings; 5{,}514 / 1{,}246 / 1{,}744 calls); audio slowed by a factor of two with the sample-rate trick used by Voxaboxen, so that a median call spans ten 20\,ms tokens; pretraining corpus built from the training recordings only (5{,}513 calls, 49\,min of annotation-free background); 5\,s mixtures with 1--10 calls (5.36 on average, matching the real call density); a \emph{paired} no-overlap variant that uses, per mixture, the identical list of calls and gains and differs only in positions (overlap fraction 0.39 vs 0; verified identical call lists on 1500 mixtures); R3 modern, three seeds per arm, identical fine-tuning on the training recordings and identical decoders; thresholds chosen on the validation recordings for a budget of 400 false alarms per slowed hour (10\% of the call rate); collar $\tau$=0.1\,s slowed; paired bootstrap over the 13 test recordings. Because the instance decoder saturates near 300 FA/h on this data, 200 FA/h is the only matched point reached in more than 80\% of resamples. Voxaboxen was trained on the same training split with its own reproduction recipe (BEATs, bidirectional, 50 epochs, one model) and scored from its staff-decoder boxes under the same protocol; mAP at IoU 0.5 and 0.8 was computed in Voxaboxen's definition from the same boxes for all systems (Table~\ref{tab:ozf}).
+
+\begin{table*}[t]
+\centering\footnotesize
+\caption{OZF test split (13 recordings, 1{,}744 references, 548 overlapping). Operating point: validation-chosen thresholds for 400 FA per slowed hour; FAR in false alarms per slowed hour (halve for real time). R@200 and overlap R@200: pooled curve at a global FAR of 200. mAP in Voxaboxen's definition, real time, same split and boxes; Voxaboxen's published OZF numbers with its own pipeline are 97.92 / 81.23. Our models: three seeds pooled; Voxaboxen: one model.}
+\label{tab:ozf}
+\setlength{\tabcolsep}{5pt}
+\resizebox{\textwidth}{!}{\begin{tabular}{lccccccc}
+\toprule
+System & op.\ recall / FAR & overlapping & isolated & R@200 & overlap R@200 & mAP@0.5 & mAP@0.8\\
+\midrule
+R3, synthetic with overlaps, instance decoder & 0.933 / 265 & 0.823 & 0.984 & 0.924 & 0.808 & 91.2 & 56.3\\
+R3, paired no-overlap corpus, instance decoder & 0.938 / 255 & 0.831 & 0.988 & 0.926 & 0.799 & 92.2 & 52.7\\
+R3, synthetic with overlaps, frame decoder & 0.567 / 662 & 0.117 & 0.773 & --- & --- & --- & ---\\
+R3, paired no-overlap corpus, frame decoder & 0.575 / 652 & 0.125 & 0.781 & --- & --- & --- & ---\\
+Voxaboxen trained on OZF (staff recipe) & 0.929 / 196 & 0.796 & --- & 0.930 & 0.796 & 92.3 & 67.1\\
+\bottomrule
+\end{tabular}}
+\end{table*}
+
+\paragraph{C6 is not found on OZF.} For recall, overall and on the overlapping and isolated subsets, and for both decoders, no difference between the two arms is detected: no-overlap minus overlap on overlapping calls $+0.006$ [$-0.024$, $+0.031$] at the operating points and $-0.005$ [$-0.038$, $+0.026$] at 200 FA/h; overall $+0.005$ [$-0.004$, $+0.014$] and $+0.003$ [$-0.007$, $+0.013$]; isolated $+0.007$ [$+0.001$, $+0.013$]; frame decoder $+0.008$ [$-0.002$, $+0.018$]. Per seed the operating-point recall is 0.929--0.938 (overlaps) against 0.935--0.944 (no overlaps). On the six synthetic OZF test sets with overlap ratio 0 to 1 (inference only, frozen thresholds; a different acoustic domain, recall 0.34--0.62) both arms degrade with the overlap ratio alike. The mAP means of the two arms differ (Table~\ref{tab:ozf}) and were not bootstrapped; we draw no conclusion from them. What is established is that the effect of Section~\ref{sec:noov} is found on the whale corpus and not found on OZF. The corpora differ in several ways at once: the amount of fine-tuning labels (about 400 calls per fold against 5{,}514 with 32\% overlapping), call duration (seconds against a tenth of a second), acoustics and recording conditions, and the origin of the pretraining clips; the label amount is one candidate explanation among these, and none was varied in isolation.
+\paragraph{What does transfer.} The event pathway with instance decoding against the frame decoder of the same models: $+0.364$ [$+0.311$, $+0.416$] overall and $+0.705$ [$+0.664$, $+0.746$] on overlapping calls at the operating points (frame FAR 660 against 260).
+\paragraph{Against Voxaboxen on OZF.} Under recall at matched FAR the two systems give close results and no difference is established: R3 (overlap arm) minus Voxaboxen $-0.004$ [$-0.017$, $+0.012$] at 200 FA/h and $+0.014$ [$-0.029$, $+0.070$] on overlapping calls; at the operating points $+0.004$ [$-0.009$, $+0.019$] with our model at a higher FAR. The overall interval is narrow enough to exclude a difference larger than about 0.02 in either direction; on overlapping calls it is wider and allows an advantage of either system up to 0.07; a formal equivalence claim would need a pre-registered margin, which we did not set. Under mAP the systems are close at IoU 0.5 (91--92 against 92.3) and Voxaboxen scores higher at IoU 0.8 (67.1 against 53--58): worse quality of our detections under strict interval agreement, consistent with less precise localisation, although mAP also depends on score ranking and duplicate detections, which we did not separate. Our reproduction of Voxaboxen is itself below its published 97.9 / 81.2, obtained with the authors' own pipeline; this gap is a limitation of the comparison. The whale advantage at low false-alarm rates is thus not a general superiority of the detector; on this data a 6$\times$ smaller encoder gives close recall and lower mAP at IoU 0.8.
+
+\section{Discussion and limitations}
+\paragraph{What the measurements support.} A compact single-direction instance detector can be built from measured pieces: an event branch trained on construction labels during pretraining (C1), the event pathway with instance decoding (C3), and, on the whale corpus, synthetic overlaps that the event pathway benefits from (C6); the encoder configuration matters (C4) and the unit objective does not detectably add to the branch (C2). Against the field-fine-tuned Voxaboxen we tested on the whale data, the result is an advantage at 61 and 100 FA/h and an unresolved comparison above (C5); on OZF it is close recall at matched FAR with no established difference and a lower mAP at IoU 0.8. The most informative pair of results is C6 and its non-replication: the same change of training data moves the event pathway and the frame-wise track in opposite directions on the whale corpus, where field labels are scarce, and produces no detectable change on OZF; which difference between the corpora is responsible is not established.
+\paragraph{What they do not support.} Novelty of the task formulation, of synthetic overlaps or of construction labels (all published, Section~2), or of the single-direction design, which is Voxaboxen's ablated variant and slightly worse than the full model under mAP in its paper; superiority over Voxaboxen as a method (its synthetic checkpoint is unresolved at 61 FA/h, a recall-oriented fine-tuning regime for it was not searched, and on OZF recall is close with lower mAP at IoU 0.8); attribution of the block effect to RMSNorm, GeGLU, RoPE, QK-norm, local attention, gated convolution or size; any statement about what soft-NMS or bipartite merging cost Voxaboxen on overlapping calls, or about a benefit of having no box NMS; equality of isolated-call recall between the two synthetic corpora; any explanation of the OZF non-replication, since label amount, call duration and acoustics all differ between the corpora; speed or memory savings, which were not measured (only the parameter count is 6$\times$ smaller).
+\paragraph{Remaining misses on overlapping calls (diagnostic).} At the R3 operating points 34.7 of the 119 overlapping references per run are missed. Grouped by the distance from the missed reference's onset to the nearest other reference onset: 2.0 (6\%) within 20\,ms, 10.0 (29\%) within the fold's chosen $d_{\min}$, 12.7 (37\%) farther but with an onset peak $\ge$0.05 at the reference onset, 10.0 (29\%) with no onset evidence. This is a breakdown by proximity, not a proof of causes, and onsets within 20\,ms are not the same as onsets in one token; what it says is that onset collisions are rare and do not motivate a multi-instance-per-token output as the next priority, whereas the suppression by $d_{\min}$ under the false-alarm budget and plain sensitivity account for most of the remainder.
+\paragraph{Scale and intervals.} Two datasets: 17 whale recordings with 613 references (119 overlapping) and the OZF test split with 1{,}744 (548 overlapping), against eight public datasets in the Voxaboxen paper; the whale pretraining assumes a large corpus of isolated target-species clips (45k), while on OZF the corpus was cut from the training recordings; one model per fold for Voxaboxen against three seeds for ours; intervals are conditional on the trained models and the seed spread in Table~\ref{tab:seeds} is of the same order as several of the effects (R3 seeds span 0.05 at the operating point). The signs of C1, C3 and C6 hold in every seed; C2 and the Voxaboxen comparison above 100 FA/h do not resolve at this scale. Operating points overshoot the development budget by up to 30\%, a deployment problem that matched-FAR reporting sidesteps but does not solve.
+
+\section{Conclusion}
+A 17.8M single-direction detector that learns presence, onset and duration from synthetic-mixture construction labels and decodes instances without box NMS finds more calls than the field-fine-tuned Voxaboxen configuration we tested at 61 and 100 false alarms per hour on the whale recordings, with most of the difference on overlapping calls; above that load the comparison is unresolved. On the public zebra-finch data it gives recall close to that of a Voxaboxen trained on the same split, with no established difference, and a lower mAP at IoU 0.8. The contribution of each component is measured on the annotator's criterion with paired intervals: pretraining the event branch on construction labels and reading instances from the event pathway are the two effects that carry the detector; on the whale corpus the gain on overlapping calls depends on overlap in the synthetic pretraining data, on the zebra-finch data no such dependence is found, and the masked-unit objective contributes nothing we could detect.
+
+\section*{Reproducibility}
+Every pretraining, fine-tuning and decoding run is stored with hardware fingerprint, code snapshot, data checksums, training curve and telemetry in an SQLite experiment database; the hypotheses behind C1--C6 are versioned with their verdicts; per-recording predictions and per-threshold counts of all systems, including the Voxaboxen variants, are saved and every interval in this paper is recomputable from them. Code, the synthetic-mixture recipe (including the no-overlap switch), the Voxaboxen fold manifests, the four documented inference patches and checkpoints will be released.
+
+\appendix
+\section{Voxaboxen protocol}
+\label{app:vox}
+\paragraph{Version and decoder.} voxaboxen 0.2.0, commit 20cf966, in a fresh environment (Python 3.12, PyTorch 2.14). The April 2026 hyperparameters match this version's arguments one to one. Staff decoder (function \texttt{combine\_fwd\_bck\_preds}): within each direction, detection peaks (peak distance 5 frames) and soft-NMS ($\sigma$=0.5, IoU 0.5); the forward and backward sets are merged by maximum bipartite matching (Hopcroft--Karp) over pairs with IoU $\ge$0.5; a matched pair becomes one box with averaged bounds and Detection Probability $(1-(1-p_{\mathrm{fwd}})(1-p_{\mathrm{bck}}))\cdot\mathrm{IoU}$, unmatched boxes keep their own probability; finally \emph{all} combined boxes, matched and unmatched, are kept if their Detection Probability exceeds the discard threshold, which the package chooses on validation. Because that filter is the last step and applies to every box, a threshold $t$ applied to the combined boxes exported with discard 0 reproduces the staff decoder with discard $t$ exactly (up to the strict inequality).
+\paragraph{Synthetic-only checkpoint.} Trained in April 2026 on 40 synthetic recordings of 60\,s built from the same lab clips, placed sequentially with gaps of 0.5--3\,s (461 training events, none overlapping; this is a property of our local run, not of the published method), 50 epochs. Its stored field predictions start at threshold 0.5, hence 61.4 FA/h is the highest reachable load.
+\paragraph{Field fine-tuning.} Per test fold: start from the synthetic-only detector (encoder and both direction heads), train on the training recordings minus the two development recordings (0.6--0.9\,h of audio per fold), batch 16, 10\,s clips, learning rate $5\cdot10^{-5}$, encoder unfrozen from epoch 3, up to 50 epochs with the package's early stopping (patience 10, minimum 5 epochs). In this version early stopping acts on the training loss and final-model.pt holds the last epoch; this is the staff variant. The best-validation variant saves the checkpoint with the best validation combined \Fone{} (one added line; best epochs 19/42/25). Our own fine-tuning sees 1.5k$\times$8$\times$10\,s $\approx$ 33\,h of audio, i.e.\ 36--55 passes over the same recordings.
+\paragraph{Inference and scoring.} Staff inference on test and development recordings with detection threshold 0.05 and combination discard 0; the operating threshold on the combined Detection Probability is chosen per fold on the development recordings for a budget of 100 FA/h (0.70/0.75/0.80), the curve sweeps that threshold, and the scorer is the one of Section~\ref{sec:protocol}.
+\paragraph{Patches.} The inference command of this commit fails at the forward/backward combination; four mismatches were fixed in a local copy with the originals kept (attribute name of the discard threshold, keyword name of the IoU threshold, the directory the combination reads from, and the exported file-name suffix the combination expects). The decoding algorithm was not changed; a smoke test on one recording with the April checkpoint reproduced the stored boxes above 0.5.
+
+\bibliographystyle{plainnat}
+\begin{thebibliography}{12}
+\bibitem[Hsu et al.(2021)]{hsu2021hubert} W.-N. Hsu, B. Bolte, Y.-H. H. Tsai, K. Lakhotia, R. Salakhutdinov, A. Mohamed. HuBERT: Self-supervised speech representation learning by masked prediction of hidden units. \emph{IEEE/ACM TASLP}, 29:3451--3460, 2021.
+\bibitem[Chen et al.(2023)]{chen2023beats} S. Chen, Y. Wu, C. Wang, S. Liu, D. Tompkins, Z. Chen, F. Wei. BEATs: Audio pre-training with acoustic tokenizers. \emph{ICML}, 2023.
+\bibitem[Hagiwara(2023)]{hagiwara2023aves} M. Hagiwara. AVES: Animal vocalization encoder based on self-supervision. \emph{ICASSP}, 2023.
+\bibitem[Mesaros et al.(2016)]{mesaros2016metrics} A. Mesaros, T. Heittola, T. Virtanen. Metrics for polyphonic sound event detection. \emph{Applied Sciences}, 6(6):162, 2016.
+\bibitem[Mahon et al.(2025)]{mahon2025voxaboxen} L. Mahon, B. Hoffman, L. James, M. Cusimano, M. Hagiwara, S. C. Woolley, F. Effenberger, S. Keen, J.-Y. Liu, O. Pietquin. Robust detection of overlapping bioacoustic sound events. arXiv:2503.02389, 2025.
+\bibitem[Hoffman et al.(2025)]{hoffman2025synthetic} B. Hoffman, D. Robinson, M. Miron, V. Baglione, D. Canestrari, D. Elias, E. Trapote, F. Effenberger, M. Cusimano, M. Hagiwara, O. Pietquin. Synthetic data enables context-aware bioacoustic sound event detection. arXiv:2503.00296, 2025.
+\bibitem[Salamon et al.(2017)]{salamon2017scaper} J. Salamon, D. MacConnell, M. Cartwright, P. Li, J. P. Bello. Scaper: A library for soundscape synthesis and augmentation. \emph{WASPAA}, 2017.
+\bibitem[Turpault et al.(2019)]{turpault2019desed} N. Turpault, R. Serizel, A. Parag Shah, J. Salamon. Sound event detection in domestic environments with weakly labeled data and soundscape synthesis. \emph{DCASE Workshop}, 2019.
+\bibitem[Venkatesh et al.(2022)]{venkatesh2022yoho} S. Venkatesh, D. Moffat, E. R. Miranda. You Only Hear Once: a YOLO-like algorithm for audio segmentation and sound event detection. \emph{Applied Sciences}, 12(7):3293, 2022.
+\bibitem[Ebbers et al.(2024)]{ebbers2024sebbs} J. Ebbers, F. G. Germain, G. Wichern, J. Le Roux. Sound event bounding boxes. \emph{Interspeech}, 2024.
+\bibitem[Sheipak et al.(2026a)]{sheipak2026mmb} I. Sheipak et al. MarineMammalBench: Task, temporal resolution, and adaptation in marine audio transfer. \emph{under review}, 2026.
+\bibitem[Sheipak et al.(2026b)]{sheipak2026what} I. Sheipak et al. What moves detection and what moves the boundary? Target source, encoder block and fine-tuning in self-supervised detection of killer-whale calls under limited data. \emph{draft}, 2026.
+\end{thebibliography}
+\end{document}

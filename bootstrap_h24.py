@@ -1,12 +1,13 @@
 """H24: paired recording-level bootstrap, R3 pretrained on the no-overlap synthetic corpus (fte_R3noov_seed0-2) vs the default corpus (fte_R3_seed0-2).
 Same machinery as bootstrap_instances.py (imported). Primary readout: recall on the overlapping-reference subset at matched FAR; secondary: R@100/150/61, isolated recall.
-Usage: python bootstrap_h24.py [budget=100] [B=2000]"""
+Usage: python bootstrap_h24.py [budget=100] [B=2000] [groupA=R3noov] [groupB=R3] [out=h24]
+H22 (vanilla block vs modern block) is the same script with groups R3van R3 and out h22."""
 import sys, json, numpy as np
-sys.argv = [sys.argv[0]] + sys.argv[1:]
 import bootstrap_instances as bi
 from bootstrap_instances import *
 
-NAMES = {'R3': [f'fte_R3_seed{s}' for s in range(3)], 'R3noov': [f'fte_R3noov_seed{s}' for s in range(3)]}
+GA = sys.argv[3] if len(sys.argv) > 3 else 'R3noov'; GB = sys.argv[4] if len(sys.argv) > 4 else 'R3'; OUT = sys.argv[5] if len(sys.argv) > 5 else 'h24'
+NAMES = {g: [f'fte_{g}_seed{s}' for s in range(3)] for g in (GB, GA)}
 C = {g: [run_counts(n) for n in names] for g, names in NAMES.items()}
 groups = {f'{g}/inst': [c['instance'] for c in C[g]] for g in NAMES} | {f'{g}/frame': [c['frame'] for c in C[g]] for g in NAMES}
 rng = np.random.default_rng(0); k = len(RECS); full = np.arange(k); IDX = [rng.integers(0, k, k) for _ in range(NB)]
@@ -32,7 +33,7 @@ for g, grp in groups.items():
     for i, r in enumerate(per_seed[g]): print(f"    seed{i}: op R {r[0]:.3f} FAR {r[1]:.0f} ov {r[2]:.3f} iso {r[11]:.3f} | R@100 {r[3]:.3f} R@61 {r[5]:.3f} | OV@100 {r[7]:.3f} OV@61 {r[8]:.3f} ISO@100 {r[10]:.3f}")
 res = {}
 print('\npaired differences (recording-level bootstrap, recording carries all seeds):')
-for a, b in [('R3noov/inst', 'R3/inst'), ('R3noov/frame', 'R3/frame'), ('R3noov/inst', 'R3noov/frame'), ('R3/inst', 'R3/frame')]:
+for a, b in [(f'{GA}/inst', f'{GB}/inst'), (f'{GA}/frame', f'{GB}/frame'), (f'{GA}/inst', f'{GA}/frame'), (f'{GB}/inst', f'{GB}/frame')]:
     d = S[a] - S[b]; rr = {}
     for j, lab in enumerate(LAB):
         dj = d[:, j]; ok = ~np.isnan(dj); dj = dj[ok]
@@ -41,5 +42,5 @@ for a, b in [('R3noov/inst', 'R3/inst'), ('R3noov/frame', 'R3/frame'), ('R3noov/
     print(f"  {a} - {b}:"); 
     for lab in LAB: print(f"      {lab:14s} {fmt(rr[lab])}")
     res[f'{a} - {b}'] = rr
-json.dump(dict(budget=BUDGET, B=NB, labels=LAB, per_seed=per_seed, diffs=res, full={g: [round(float(x), 3) for x in row(grp, full)] for g, grp in groups.items()}), open(ROOT / 'results' / f'bootstrap_h24_b{BUDGET}.json', 'w'), indent=1)
-print('saved results/bootstrap_h24_b%d.json' % BUDGET)
+json.dump(dict(budget=BUDGET, B=NB, labels=LAB, per_seed=per_seed, diffs=res, full={g: [round(float(x), 3) for x in row(grp, full)] for g, grp in groups.items()}), open(ROOT / 'results' / f'bootstrap_{OUT}_b{BUDGET}.json', 'w'), indent=1)
+print(f'saved results/bootstrap_{OUT}_b{BUDGET}.json')
