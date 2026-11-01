@@ -234,3 +234,26 @@ class ParallelPrepareTests(unittest.TestCase):
                     self.assertEqual(selected.call_count, int(family == "pacific_sound"))
                     self.assertNotIn("source_acquisition", origin)
                     self.assertEqual(materialized.read_bytes(), b"full source")
+
+    def test_resume_matches_source_etag_and_preserves_existing_artifacts(self):
+        row = self.row("a", "versioned-source", "A")
+        row["source_etag"] = '"version-a"'
+        config = self.config({"a": 5})
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            self.run_prepare(config, [row], output)
+            receipt = next((output / "receipts" / "a").glob("*.json"))
+            original_receipt = receipt.read_bytes()
+            shard = Path(json.loads(original_receipt)["tar_path"])
+            original_tar_hash = m.digest(shard)
+            same_version = {key: value for key, value in row.items() if key != "source_etag"}
+            same_version["etag"] = "version-a"
+            with patch.object(m, "_source", side_effect=AssertionError("must not redownload")), \
+                    patch.object(m, "_convert", side_effect=AssertionError("must not re-decode")), \
+                    patch.object(m.shutil, "which", return_value="mock-tool"):
+                result = m.prepare(config, [same_version], output, workers=2, download_workers=4)
+                self.assertTrue(result["sources"]["a"]["quota_met"])
+                with self.assertRaisesRegex(ValueError, "incompatible"):
+                    m.prepare(config, [{**row, "source_etag": '"version-b"'}], output, workers=2, download_workers=4)
+            self.assertEqual(receipt.read_bytes(), original_receipt)
+            self.assertEqual(m.digest(shard), original_tar_hash)

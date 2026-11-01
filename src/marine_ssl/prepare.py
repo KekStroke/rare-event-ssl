@@ -44,8 +44,11 @@ def _signature(config):
 
 
 def _same_source(saved, row):
-    return all(saved.get(key) == row.get(key) for key in
-               ("source_id", "url", "revision", "sha256", "source_generation", "generation", "local_path"))
+    def etag(origin):
+        return str(origin.get("source_etag") or origin.get("etag") or "").strip().strip('"')
+    return (etag(saved) == etag(row)
+            and all(saved.get(key) == row.get(key) for key in
+                    ("source_id", "url", "revision", "sha256", "source_generation", "generation", "local_path")))
 
 
 def _error_message(exc):

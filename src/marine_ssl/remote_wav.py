@@ -1,5 +1,6 @@
 """Materialize a frame-exact prefix of a version-checked uncompressed RIFF WAV."""
 
+from contextlib import contextmanager
 import hashlib
 import json
 import math
@@ -119,6 +120,30 @@ def _header(data, size, max_seconds):
     return None
 
 
+@contextmanager
+def _materialization_lock(path):
+    """Lock the persistent inode; the OS releases ownership on process death."""
+    with path.open("a+b") as stream:
+        if os.name == "nt":
+            import msvcrt
+            if os.fstat(stream.fileno()).st_size == 0:
+                stream.write(b"\0")
+                stream.flush()
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 def acquire_wav_prefix(row, path, max_seconds, session=None):
     """Return interval provenance, or None for a safe full-download fallback.
 
@@ -167,46 +192,45 @@ def acquire_wav_prefix(row, path, max_seconds, session=None):
     for candidate in (path, receipt, temporary, lock):
         if candidate.is_symlink():
             raise ValueError("Symlink in selected WAV materialization")
-    lock.open("x").close()
-    try:
-        if path.exists():
-            if not receipt.exists():
-                raise ValueError("Existing WAV materialization has no ownership receipt")
-            saved = json.loads(receipt.read_text(encoding="utf-8"))
-            keys = ("schema_version", "source_id", "source_etag", "source_object_bytes", "source_header_sha256", "byte_range", "materialized_bytes")
-            if (any(saved.get(key) != metadata.get(key) for key in keys)
-                    or path.stat().st_size != metadata["materialized_bytes"]
-                    or digest(path) != saved.get("materialized_sha256")):
-                raise ValueError("Existing WAV materialization differs from its source/receipt")
-            return saved
-        start, end = metadata["byte_range"]
-        for attempt in range(3):
-            try:
-                checksum, received = hashlib.sha256(header), 0
-                with _response(session, row["url"], start, end, size, etag) as response:
-                    with temporary.open("wb") as stream:
-                        stream.write(header)
-                        for block in response.iter_content(1024 * 1024):
-                            if received + len(block) > end - start + 1:
-                                raise ValueError("WAV body exceeded the selected interval")
-                            stream.write(block)
-                            checksum.update(block)
-                            received += len(block)
-                        if received != end - start + 1:
-                            raise requests.ConnectionError("Incomplete selected WAV interval")
-                        if metadata["materialized_padding_bytes"]:
-                            stream.write(b"\0")
-                            checksum.update(b"\0")
-                if temporary.stat().st_size != metadata["materialized_bytes"]:
-                    raise ValueError("Materialized WAV length is inconsistent")
-                metadata["materialized_sha256"] = checksum.hexdigest()
-                os.replace(temporary, path)
-                write_json(receipt, metadata)
-                return metadata
-            except requests.RequestException:
-                if attempt == 2:
-                    raise
-                time.sleep(2 ** attempt)
-    finally:
-        temporary.unlink(missing_ok=True)
-        lock.unlink(missing_ok=True)
+    with _materialization_lock(lock):
+        try:
+            if path.exists():
+                if not receipt.exists():
+                    raise ValueError("Existing WAV materialization has no ownership receipt")
+                saved = json.loads(receipt.read_text(encoding="utf-8"))
+                keys = ("schema_version", "source_id", "source_etag", "source_object_bytes", "source_header_sha256", "byte_range", "materialized_bytes")
+                if (any(saved.get(key) != metadata.get(key) for key in keys)
+                        or path.stat().st_size != metadata["materialized_bytes"]
+                        or digest(path) != saved.get("materialized_sha256")):
+                    raise ValueError("Existing WAV materialization differs from its source/receipt")
+                return saved
+            start, end = metadata["byte_range"]
+            for attempt in range(3):
+                try:
+                    checksum, received = hashlib.sha256(header), 0
+                    with _response(session, row["url"], start, end, size, etag) as response:
+                        with temporary.open("wb") as stream:
+                            stream.write(header)
+                            for block in response.iter_content(1024 * 1024):
+                                if received + len(block) > end - start + 1:
+                                    raise ValueError("WAV body exceeded the selected interval")
+                                stream.write(block)
+                                checksum.update(block)
+                                received += len(block)
+                            if received != end - start + 1:
+                                raise requests.ConnectionError("Incomplete selected WAV interval")
+                            if metadata["materialized_padding_bytes"]:
+                                stream.write(b"\0")
+                                checksum.update(b"\0")
+                    if temporary.stat().st_size != metadata["materialized_bytes"]:
+                        raise ValueError("Materialized WAV length is inconsistent")
+                    metadata["materialized_sha256"] = checksum.hexdigest()
+                    os.replace(temporary, path)
+                    write_json(receipt, metadata)
+                    return metadata
+                except requests.RequestException:
+                    if attempt == 2:
+                        raise
+                    time.sleep(2 ** attempt)
+        finally:
+            temporary.unlink(missing_ok=True)

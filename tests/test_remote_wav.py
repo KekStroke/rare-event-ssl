@@ -1,5 +1,8 @@
 import hashlib
 import io
+import os
+import subprocess
+import sys
 from pathlib import Path
 import struct
 import tempfile
@@ -124,6 +127,45 @@ class PrefixTests(unittest.TestCase):
         self.assertEqual(4, len(session.calls))
         self.assertFalse(self.path.exists())
         self.assertFalse(self.path.with_name(self.path.name + ".range.part").exists())
+
+    def test_abandoned_lock_marker_and_terminated_owner_do_not_block_resume(self):
+        source = wav(bytes(range(64)))
+        lock = self.path.with_name(self.path.name + ".range.lock")
+        lock.write_bytes(b"old marker")
+        child_code = """
+import os,sys,time
+stream=open(sys.argv[1], 'a+b')
+if os.name == 'nt':
+    import msvcrt
+    if os.fstat(stream.fileno()).st_size == 0:
+        stream.write(b'0');stream.flush()
+    stream.seek(0);msvcrt.locking(stream.fileno(),msvcrt.LK_NBLCK,1)
+else:
+    import fcntl
+    fcntl.flock(stream.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+print('locked',flush=True)
+time.sleep(60)
+"""
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        child = subprocess.Popen([sys.executable, "-c", child_code, str(lock)],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True, creationflags=flags)
+        try:
+            self.assertEqual("locked", child.stdout.readline().strip())
+            with self.assertRaises(OSError):
+                acquire_wav_prefix(self.row(source), self.path, 1, session=Session(source))
+            self.assertFalse(self.path.exists())
+            child.terminate()
+            child.wait(timeout=5)
+            result = acquire_wav_prefix(self.row(source), self.path, 1, session=Session(source))
+            self.assertEqual(8, result["selected_frames"])
+            self.assertTrue(lock.exists())  # Never unlink a potentially locked inode.
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
+            child.stdout.close()
+            child.stderr.close()
 
     def test_unsupported_layout_or_ignored_range_falls_back(self):
         for source in (b"RF64" + bytes(100), wav(bytes(64), code=6),
