@@ -167,3 +167,70 @@ class ParallelPrepareTests(unittest.TestCase):
                     self.assertEqual(recorded["quality"], result["quality"])
                 self.assertEqual(raw.read_bytes(), original)
         self.assertEqual(observed, [True, False, False])
+
+    def test_drained_batch_refills_until_all_candidates_are_exhausted(self):
+        rows = [self.row("a", f"a{number:03d}", chr(33 + number)) for number in range(100)]
+        rows[50]["test_windows"] = rows[49]["test_windows"]
+        config = self.config({"a": 600})
+        config["max_inflight_records"] = 1  # Deterministically drains before refill.
+        converted = []
+        def convert(row, *args):
+            converted.append(row["source_id"])
+            if row["source_id"] == "a005":
+                return {"status": "duplicate_or_no_complete_unique_windows", "source_id": row["source_id"]}, None
+            return self.convert(row, *args)
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self.run_prepare(config, rows, Path(temporary), convert)
+        self.assertEqual(converted, [row["source_id"] for row in rows])
+        self.assertEqual(result["counts"]["downloaded_recordings"], 100)
+        self.assertEqual(result["counts"]["prepared_recordings"], 98)
+        self.assertEqual(result["sources"]["a"]["actual_frames"], 98 * 80000)
+        self.assertFalse(result["sources"]["a"]["quota_met"])
+        self.assertEqual(result["status"], "incomplete")
+
+    def test_range_prefix_is_pacific_only_falls_back_and_preserves_hash_scope(self):
+        import marine_ssl.remote_wav as remote_wav
+        import marine_ssl.fast_audio as fast_audio
+        config = self.config({"a": 5})
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            def row(family):
+                return {"source_key": family, "source_family": family, "source_id": "original-id",
+                        "url": "https://public.example/recording.wav?signature=not-for-owner",
+                        "path_in_source": "2020/09/recording.wav", "revision": "pinned",
+                        "source_etag": "etag", "bytes": 100000, "sha256": "a" * 64,
+                        "use_range_prefix": True, "per_record_max_seconds": 21600}
+            acquisition = {"source_etag": "etag", "byte_range": [44, 2043], "source_sha256_verified": False}
+            def ranged(origin, path, seconds):
+                self.assertEqual(seconds, 21600)
+                path.write_bytes(b"materialized source prefix")
+                return dict(acquisition)
+            def full(url, path, **kwargs):
+                path.write_bytes(b"full source")
+                return path
+            original = row("pacific_sound")
+            with patch.object(remote_wav, "acquire_wav_prefix", side_effect=ranged) as selected, \
+                    patch.object(m, "download", side_effect=full) as download:
+                raw, scratch = m._source(original, root / "range", 0)
+                self.assertEqual(selected.call_count, 1); download.assert_not_called()
+            owner = json.loads((scratch / "owner.json").read_text())
+            self.assertEqual(owner["path_in_source"], "2020/09/recording.wav")
+            self.assertEqual(owner["expected_bytes"], 100000)
+            self.assertNotIn("not-for-owner", json.dumps(owner))
+            metadata = {"native": {"sample_rate": "16000", "channels": 1}, "backend": "mock",
+                        "versions": {}, "decoded_frames": 80000, "full_decode_verified": True}
+            with patch.object(fast_audio, "decode_pcm16", return_value=(metadata, bytes([1, 0]) * 80000)):
+                result, _ = m._convert(original, raw, scratch, 80000, config, set(), set())
+            self.assertIsNone(result["source_sha256"])
+            self.assertFalse(result["source_sha256_verified"])
+            self.assertEqual(result["materialized_source_sha256"], m.digest(raw))
+            self.assertEqual(result["source"]["sha256"], "a" * 64)
+            for number, family in enumerate(("orcasound", "pacific_sound")):
+                origin = row(family)
+                with patch.object(remote_wav, "acquire_wav_prefix", return_value=None) as selected, \
+                        patch.object(m, "download", side_effect=full) as download:
+                    materialized, _ = m._source(origin, root / str(number), 0)
+                    self.assertEqual(download.call_count, 1)
+                    self.assertEqual(selected.call_count, int(family == "pacific_sound"))
+                    self.assertNotIn("source_acquisition", origin)
+                    self.assertEqual(materialized.read_bytes(), b"full source")

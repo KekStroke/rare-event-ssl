@@ -53,6 +53,7 @@ sources:
     excluded_prefixes:
       - 2021_9_12_OS_YearsBestVocalPassby/
   pacific_sound:
+    use_range_prefix: true
     per_record_max_seconds: 21600
     kind: s3
     source_family: pacific_sound

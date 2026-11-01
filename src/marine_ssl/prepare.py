@@ -48,6 +48,19 @@ def _same_source(saved, row):
                ("source_id", "url", "revision", "sha256", "source_generation", "generation", "local_path"))
 
 
+def _error_message(exc):
+    message = f"{type(exc).__name__}: {exc}"
+    return re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?<redacted>", message)
+
+
+def _origin_metadata(row):
+    """Public canonical identifiers only; never retain signed/auth URL queries."""
+    return {"source_id": row.get("source_id"), "source_family": row.get("source_family"),
+            "path_in_source": str(row.get("path_in_source") or "").split("?", 1)[0].split("#", 1)[0],
+            "revision": row.get("revision"), "expected_bytes": row.get("bytes", row.get("size")),
+            "source_etag": row.get("source_etag") or row.get("etag")}
+
+
 def _source(row, output, reserve_bytes):
     """Transfer only to owned scratch; existing raw originals are read-only."""
     if row.get("local_path"):
@@ -63,12 +76,14 @@ def _source(row, output, reserve_bytes):
     root.mkdir(parents=True, exist_ok=True)
     owner = root / "owner.json"
     if owner.exists():
-        if json.loads(owner.read_text(encoding="utf-8")).get("source_id") != row["source_id"]:
+        saved_owner = json.loads(owner.read_text(encoding="utf-8"))
+        if saved_owner.get("source_id") != row["source_id"]:
             raise ValueError("Scratch ownership differs")
+        write_json(owner, {**saved_owner, **_origin_metadata(row)})
     elif any(root.iterdir()):
         raise ValueError("Refusing to overwrite scratch without an ownership record")
     else:
-        write_json(owner, {"source_id": row["source_id"], "version": VERSION})
+        write_json(owner, {**_origin_metadata(row), "version": VERSION})
     size = row.get("bytes", row.get("size"))
     if size is None:
         raise ValueError("Remote source size required for bounded capacity planning")
@@ -76,6 +91,14 @@ def _source(row, output, reserve_bytes):
         raise RuntimeError("Free-space reserve reached")
     suffix = Path(str(row.get("path_in_source") or row.get("url", "")).split("?")[0]).suffix
     target = root / ("source" + suffix)
+    if (row.get("source_family") == "pacific_sound" and row.get("use_range_prefix")
+            and not (target.is_file() and target.with_name(target.name + ".receipt.json").is_file())):
+        from .remote_wav import acquire_wav_prefix
+        ranged = root / "source.prefix.wav"
+        acquisition = acquire_wav_prefix(row, ranged, row["per_record_max_seconds"])
+        if acquisition is not None:
+            row["source_acquisition"] = acquisition
+            return ranged, root
     url = row["url"]
     generation = row.get("source_generation") or row.get("generation")
     if generation and "storage.googleapis.com/" in url:
@@ -212,7 +235,10 @@ def _convert(row, raw, scratch, remaining_frames, config, seen_segments, seen_pc
                 if metadata.get("decoded_frames") is not None and decoded_frames != metadata["decoded_frames"]:
                     raise ValueError("Decoded frame count differs from decoder metadata")
                 result = {"schema_version": VERSION, "status": "prepared", "source": row,
-                          "native": metadata["native"], "source_sha256": digest(raw),
+                          "native": metadata["native"],
+                          "source_sha256": None if row.get("source_acquisition") else digest(raw),
+                          "materialized_source_sha256": digest(raw) if row.get("source_acquisition") else None,
+                          "source_acquisition": row.get("source_acquisition"),
                           "normalized_pcm_sha256": pcm_hash.hexdigest(), "decoded_frames": decoded_frames,
                           "sample_rate_hz": rate, "channels": 1, "subtype": "PCM_16",
                           "selected_frames": selected_frames, "duration_seconds": selected_frames / rate,
@@ -222,6 +248,8 @@ def _convert(row, raw, scratch, remaining_frames, config, seen_segments, seen_pc
                           "full_decode_verified": True, "ready_for_training": False,
                           "decoder_backend": metadata["backend"], "decoder_versions": metadata.get("versions", {}),
                           "container_repair": metadata.get("container_repair"), "quality": metadata.get("quality", {})}
+                if row.get("source_acquisition"):
+                    result["source_sha256_verified"] = False
                 _add(archive, "recording.json", (json.dumps(result, ensure_ascii=False) + "\n").encode())
         if pcm_hash.hexdigest() in seen_pcm or not selected:
             temporary.unlink()
@@ -281,6 +309,10 @@ def prepare(config, candidates, output, *, workers=8, download_workers=None):
             continue
         if row.get("clearance_scope") != "source_metadata_only" or row.get("source_family") != config["sources"][source]["source_family"]:
             raise ValueError("Only planner-cleared pretrain candidates are accepted")
+        if row.get("source_family") == "pacific_sound":
+            spec = config["sources"][source]
+            row = {**row, "use_range_prefix": bool(spec.get("use_range_prefix", False)),
+                   "per_record_max_seconds": spec.get("per_record_max_seconds", config.get("per_record_max_seconds", 3600))}
         identities.add(identity); rows_by_key[(source, _key(row))] = row; queues[source].append(row)
     lockfile = output / ".prepare.lock"
     with lockfile.open("x", encoding="utf-8") as stream:
@@ -319,7 +351,7 @@ def prepare(config, candidates, output, *, workers=8, download_workers=None):
     def clean_raw(task):
         raw, scratch = task.get("raw"), task.get("scratch")
         if raw is not None and scratch:
-            for path in (raw, raw.with_name(raw.name + ".receipt.json")):
+            for path in (raw, raw.with_name(raw.name + ".receipt.json"), raw.with_name(raw.name + ".range.receipt.json")):
                 if path.is_file() and not path.is_symlink():
                     path.unlink()
 
@@ -358,6 +390,8 @@ def prepare(config, candidates, output, *, workers=8, download_workers=None):
         if (len(result["segments"]) != result["segment_count"]
                 or sum(segment.get("frames", window) for segment in result["segments"]) != result["selected_frames"]):
             raise ValueError("Existing receipt frame/segment counts differ")
+        if result.get("source_acquisition") or result.get("source", {}).get("source_acquisition"):
+            row = {**row, "source_acquisition": result.get("source_acquisition") or result["source"]["source_acquisition"]}
         return row, result, shard, receipt
 
     def decode_task(task):
@@ -382,7 +416,7 @@ def prepare(config, candidates, output, *, workers=8, download_workers=None):
     def commit(task, outcome):
         result, temporary, row = outcome["result"], outcome["temporary"], task["row"]
         if temporary is None:
-            issues.append({"source_key": row["source_key"], "source_id": row["source_id"], **result})
+            issues.append({"source_key": row["source_key"], **_origin_metadata(row), **result})
             clean_raw(task); progress[result["status"]] += 1
             return
         duplicate_pcm = result["normalized_pcm_sha256"] in seen_pcm or (
@@ -483,8 +517,8 @@ def prepare(config, candidates, output, *, workers=8, download_workers=None):
                         task, outcome = ready[source].pop(expected[source]); expected[source] += 1
                         if "error" in outcome:
                             exc = outcome["error"]; consecutive_errors += 1; progress["errors"] += 1
-                            issue = {"source_key": source, "source_id": task["row"]["source_id"],
-                                     "error": f"{type(exc).__name__}: {exc}", "status": "error",
+                            issue = {"source_key": source, **_origin_metadata(task["row"]),
+                                     "error": _error_message(exc), "status": "error",
                                      "isolated_decode_error": outcome.get("isolated_decode_error", False)}
                             issues.append(issue); print(json.dumps({"stage": "prepare_error", **issue}), flush=True)
                             checkpoint("error", force=True)
@@ -495,8 +529,8 @@ def prepare(config, candidates, output, *, workers=8, download_workers=None):
                                 commit(task, outcome); consecutive_errors = 0
                             except Exception as exc:
                                 progress["errors"] += 1
-                                issue = {"source_key": source, "source_id": task["row"]["source_id"],
-                                         "status": "commit_error", "error": f"{type(exc).__name__}: {exc}"}
+                                issue = {"source_key": source, **_origin_metadata(task["row"]),
+                                         "status": "commit_error", "error": _error_message(exc)}
                                 issues.append(issue)
                                 print(json.dumps({"stage": "prepare_error", **issue}), flush=True)
                                 checkpoint("commit_error", force=True)
@@ -508,8 +542,14 @@ def prepare(config, candidates, output, *, workers=8, download_workers=None):
                     break
                 pending = list(downloads) + list(decodes)
                 if not pending:
-                    if raw_ready: continue
-                    if not active: break
+                    if raw_ready:
+                        continue
+                    if not active:
+                        # A drained batch is not an exhausted candidate queue.
+                        # Refill after commits release the bounded admission slots.
+                        if any(queues[key] and totals[key] < targets[key] for key in targets):
+                            continue
+                        break
                     raise RuntimeError("Ordered commit pipeline cannot make progress")
                 completed, _ = wait(pending, return_when=FIRST_COMPLETED)
                 for future in sorted(completed, key=lambda item: (downloads.get(item) or decodes[item])["id"]):
@@ -532,7 +572,7 @@ def prepare(config, candidates, output, *, workers=8, download_workers=None):
         print(json.dumps(result), flush=True)
         return result
     except BaseException as exc:
-        issues.append({"status": "fatal_error", "error": f"{type(exc).__name__}: {exc}"})
+        issues.append({"status": "fatal_error", "error": _error_message(exc)})
         print(json.dumps({"stage": "prepare_error", **issues[-1]}), flush=True)
         checkpoint("fatal_error", force=True)
         raise
