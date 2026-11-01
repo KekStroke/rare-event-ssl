@@ -133,3 +133,37 @@ class ParallelPrepareTests(unittest.TestCase):
             self.assertFalse(any(source["quota_met"] for source in result["sources"].values()))
             self.assertFalse((output / ".prepare.lock").exists())
         self.assertEqual(observed, ["RuntimeError: simulated transfer failure"])
+
+    def test_legacy_header_repair_is_opted_in_only_for_orcasound_local_clock(self):
+        import marine_ssl.fast_audio as fast_audio
+        cases = [("orcasound", "unspecified_local_clock", True),
+                 ("orcasound", "utc", False), ("pacific_sound", "unspecified_local_clock", False)]
+        config = self.config({"a": 5})
+        observed = []
+        repair = {"missing_declared_frames": 2, "pcm_frames_retained": 220500, "source_fully_present": False}
+        quality = {"retained_physical_pcm_prefix": True}
+        def decode(raw, **kwargs):
+            enabled = kwargs["allow_header_repair"]
+            observed.append(enabled)
+            metadata = {"native": {"sample_rate": "44100", "channels": 1, "frames": 220500},
+                        "backend": "mock-repair", "versions": {"mock": "1"}, "decoded_frames": 80000,
+                        "full_decode_verified": True}
+            if enabled:
+                metadata.update(container_repair=repair, quality=quality)
+            return metadata, bytes([1, 0]) * 80000
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); raw = root / "original.wav"; raw.write_bytes(b"immutable original container")
+            original = raw.read_bytes()
+            for number, (family, clock, enabled) in enumerate(cases):
+                work = root / str(number); work.mkdir()
+                row = {"source_family": family, "time_basis": clock, "source_id": str(number)}
+                with patch.object(fast_audio, "decode_pcm16", side_effect=decode):
+                    result, shard = m._convert(row, raw, work, 80000, config, set(), set())
+                self.assertEqual(result["container_repair"], repair if enabled else None)
+                self.assertEqual(result["quality"], quality if enabled else {})
+                with tarfile.open(shard) as archive:
+                    recorded = json.loads(archive.extractfile("recording.json").read())
+                    self.assertEqual(recorded["container_repair"], result["container_repair"])
+                    self.assertEqual(recorded["quality"], result["quality"])
+                self.assertEqual(raw.read_bytes(), original)
+        self.assertEqual(observed, [True, False, False])

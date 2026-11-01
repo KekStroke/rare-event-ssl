@@ -58,3 +58,12 @@ evaluation protocol; inspect the validation summaries and original source groups
 
 Audio, catalogs, manifests and runtime outputs stay on shared storage, outside Git.
 Run `python -m unittest discover -s tests -v` to verify the data tools without network.
+
+## Legacy WAV containers
+
+Only legacy Orcasound may use explicit container recovery. Complete PCM followed
+by malformed non-audio metadata is retained unchanged. A tiny missing tail is
+accepted only below both 100 ms and 0.1% of declared duration; incomplete physical
+frames and incomplete five-second windows are discarded. Audio is never padded.
+Original source SHA-256, declared sizes, omitted bytes/frames and recovery quality
+are recorded in each receipt. Benchmark audio uses strict validation.

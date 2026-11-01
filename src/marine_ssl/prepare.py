@@ -115,11 +115,12 @@ def _ffmpeg_version():
 
 
 @contextmanager
-def _pcm_blocks(raw, config):
+def _pcm_blocks(raw, config, *, allow_header_repair=False):
     """Full-source decode with bounded fast-path eligibility and streaming fallback."""
     rate, width = config["sample_rate"], config["sample_rate"] * config["segment_seconds"] * 2
     from .fast_audio import decode_pcm16
-    fast = decode_pcm16(raw, target_rate=rate, max_seconds=config.get("per_record_max_seconds", 3600))
+    fast = decode_pcm16(raw, target_rate=rate, max_seconds=config.get("per_record_max_seconds", 3600),
+                        allow_header_repair=allow_header_repair)
     if fast is not None:
         metadata, pcm = fast
         if pcm is not None:
@@ -186,7 +187,9 @@ def _convert(row, raw, scratch, remaining_frames, config, seen_segments, seen_pc
     pcm_hash = hashlib.sha256(b"16000:1:int16le\n")
     decoded_frames = selected_frames = duplicate_windows = 0
     try:
-        with _pcm_blocks(raw, config) as (metadata, blocks):
+        allow_repair = (row.get("source_family") == "orcasound"
+                        and row.get("time_basis") == "unspecified_local_clock")
+        with _pcm_blocks(raw, config, allow_header_repair=allow_repair) as (metadata, blocks):
             if metadata.get("status") == "native_rate_below_target":
                 return {"status": "native_rate_below_target", "native": metadata["native"],
                         "decoder_backend": metadata["backend"], "decoder_versions": metadata.get("versions", {})}, None
@@ -217,7 +220,8 @@ def _convert(row, raw, scratch, remaining_frames, config, seen_segments, seen_pc
                           "duplicate_windows_skipped": duplicate_windows, "dropped_tail_frames": decoded_frames % window,
                           "per_record_max_seconds": config.get("per_record_max_seconds", 3600),
                           "full_decode_verified": True, "ready_for_training": False,
-                          "decoder_backend": metadata["backend"], "decoder_versions": metadata.get("versions", {})}
+                          "decoder_backend": metadata["backend"], "decoder_versions": metadata.get("versions", {}),
+                          "container_repair": metadata.get("container_repair"), "quality": metadata.get("quality", {})}
                 _add(archive, "recording.json", (json.dumps(result, ensure_ascii=False) + "\n").encode())
         if pcm_hash.hexdigest() in seen_pcm or not selected:
             temporary.unlink()

@@ -1,44 +1,100 @@
 """Bounded short-file decoding; None explicitly delegates to the FFmpeg path."""
 
 from math import gcd
+import io
 from pathlib import Path
 import struct
 
-BACKEND_ID = "soundfile-scipy-polyphase-pcm16-v1"
+BACKEND_ID = "soundfile-scipy-polyphase-pcm16-v2"
 
 
-def _wav_complete(path, size):
-    """Check RIFF chunk bounds, which some PCM decoders otherwise tolerate."""
+def _wav_source(path, size, allow_repair):
+    """Validate RIFF; explicitly recover only bounded legacy PCM16 containers."""
     with path.open("rb") as stream:
         head = stream.read(12)
         if len(head) < 12 or head[:4] not in {b"RIFF", b"RIFX"}:
-            return False  # RF64/streaming/other containers use the existing path.
+            return None, None
         order = ">" if head[:4] == b"RIFX" else "<"
         declared = struct.unpack(order + "I", head[4:8])[0]
         if declared == 0xFFFFFFFF:
-            return False
-        if head[8:12] != b"WAVE" or declared + 8 > size:
-            raise ValueError("Truncated or invalid WAV container")
+            return None, None
+        if head[8:12] != b"WAVE":
+            raise ValueError("Invalid WAV container")
         end = declared + 8
-        while stream.tell() < end:
+        problem = end > size
+        fmt, data_offset, data_count = None, None, None
+        while stream.tell() < min(end, size):
             chunk = stream.read(8)
             if len(chunk) != 8:
-                raise ValueError("Truncated WAV chunk header")
+                problem = True
+                break
             count = struct.unpack(order + "I", chunk[4:])[0]
-            if stream.tell() + count > end:
-                raise ValueError("Truncated WAV chunk")
-            stream.seek(count + (count & 1), 1)
-        return True
+            offset = stream.tell()
+            if chunk[:4] == b"fmt " and count >= 16:
+                fmt = stream.read(16)
+                stream.seek(offset)
+            if chunk[:4] == b"data":
+                if data_offset is not None:
+                    raise ValueError("Multiple WAV data chunks are unsupported")
+                data_offset, data_count = offset, count
+            if offset + count > min(end, size):
+                problem = True
+                break
+            stream.seek(offset + count + (count & 1))
+        if not problem:
+            return path, None
+        if not allow_repair:
+            raise ValueError("Truncated or invalid WAV container/chunk")
+        if head[:4] != b"RIFF" or fmt is None or len(fmt) != 16 or data_offset is None:
+            raise ValueError("Legacy WAV repair requires known little-endian PCM")
+        code, channels, rate, byte_rate, align, bits = struct.unpack("<HHIIHH", fmt)
+        if (code != 1 or bits != 16 or not 1 <= channels <= 8 or rate <= 0
+                or align != channels * 2 or byte_rate != rate * align
+                or not data_count or data_count % align):
+            raise ValueError("Legacy WAV repair requires aligned PCM16 metadata")
+        physical = max(0, size - data_offset)
+        available = min(data_count, physical)
+        usable = available - available % align
+        missing = data_count - available
+        dropped = available - usable
+        if not usable:
+            raise ValueError("No complete PCM frames available")
+        if missing or dropped:
+            declared_seconds = data_count / byte_rate
+            if (data_count - usable) / byte_rate > min(0.1, 0.001 * declared_seconds):
+                raise ValueError("Legacy WAV truncation exceeds the bounded recovery policy")
+            quality = "available_prefix"
+        else:
+            quality = "metadata_trailer_removed"
+        stream.seek(data_offset)
+        pcm = stream.read(usable)
+        if len(pcm) != usable:
+            raise ValueError("Legacy WAV payload changed during validation")
+    header = b"RIFF" + struct.pack("<I", 36 + usable) + b"WAVEfmt " + struct.pack("<I", 16)
+    header += fmt + b"data" + struct.pack("<I", usable)
+    repair = {"quality": quality, "original_file_bytes": size,
+              "original_riff_declared_bytes": end, "original_data_declared_bytes": data_count,
+              "data_offset": data_offset, "physical_data_bytes_available": physical,
+              "pcm_frames_retained": usable // align, "missing_declared_bytes": missing,
+              "missing_declared_frames": (data_count - usable) // align,
+              "dropped_partial_frame_bytes": dropped,
+              "ignored_trailing_metadata_bytes": max(0, physical - data_count),
+              "source_fully_present": not (missing or dropped),
+              "policy": "legacy_pcm16_no_added_samples_max_missing_min_0.1s_or_0.1percent"}
+    return io.BytesIO(header + pcm), repair
 
 
 def decode_pcm16(path, target_rate=16000, max_seconds=3600,
-                 max_source_bytes=64 * 1024**2, max_decoded_bytes=256 * 1024**2):
+                 max_source_bytes=64 * 1024**2, max_decoded_bytes=256 * 1024**2,
+                 allow_header_repair=False):
     """Return (metadata, full mono PCM16 bytes), or None for explicit fallback.
 
     A below-target native rate returns (skip metadata, None). Unknown codecs or
     missing optional dependencies delegate to FFmpeg. Recognized decode errors,
     nonfinite samples and truncated RIFF files raise ValueError. No five-second
-    padding or segmentation occurs here. Downmix is the equal-weight mean;
+    padding or segmentation occurs here. Header repair is strict-off by default;
+    callers may opt in only for approved legacy Orcasound sources. It preserves
+    existing complete PCM frames and records every omitted byte/frame. Downmix is the equal-weight mean;
     resampling uses scipy's Kaiser-5 polyphase filter and ceil(N*target/native)
     output frames. Conversion saturates and rounds to nearest PCM16 sample.
     """
@@ -55,10 +111,13 @@ def decode_pcm16(path, target_rate=16000, max_seconds=3600,
         from scipy.signal import resample_poly
     except ImportError:
         return None
-    if suffix in {".wav", ".wave"} and not _wav_complete(path, source_bytes):
-        return None
+    audio_source, repair = path, None
+    if suffix in {".wav", ".wave"}:
+        audio_source, repair = _wav_source(path, source_bytes, allow_header_repair)
+        if audio_source is None:
+            return None
     try:
-        audio = sf.SoundFile(str(path))
+        audio = sf.SoundFile(str(audio_source) if isinstance(audio_source, Path) else audio_source)
     except (RuntimeError, OSError):
         return None
     with audio:
@@ -74,6 +133,8 @@ def decode_pcm16(path, target_rate=16000, max_seconds=3600,
                     "versions": {"soundfile": sf.__version__, "libsndfile": sf.__libsndfile_version__,
                                  "scipy": scipy.__version__, "numpy": np.__version__},
                     "native": native, "sample_rate_hz": target_rate, "channels": 1}
+        if repair:
+            metadata.update(container_repair=repair, quality=repair["quality"])
         if native_rate < target_rate:
             return {**metadata, "status": "native_rate_below_target", "full_decode_verified": False}, None
         if max_seconds is not None and frames / native_rate > max_seconds:

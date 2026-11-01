@@ -76,6 +76,44 @@ class FastAudioTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             decode_pcm16(path)
 
+    def test_opt_in_repairs_malformed_non_audio_trailer_without_changing_raw(self):
+        path, _ = self.wav(16000, [12000, -12000] * 176000, channels=2)
+        raw = bytearray(path.read_bytes())
+        raw += b"INFO-\x00INFOIARTWHO|-\x00PortTownsend|legacy_recording.wav"
+        raw[4:8] = struct.pack("<I", len(raw) - 8)
+        original = bytes(raw)
+        path.write_bytes(original)
+        with self.assertRaises(ValueError):
+            decode_pcm16(path)
+        metadata, pcm = decode_pcm16(path, allow_header_repair=True)
+        self.assertEqual("metadata_trailer_removed", metadata["quality"])
+        self.assertEqual(176000 * 2, len(pcm))
+        self.assertEqual(0, metadata["container_repair"]["missing_declared_frames"])
+        self.assertGreater(metadata["container_repair"]["ignored_trailing_metadata_bytes"], 0)
+        self.assertEqual(original, path.read_bytes())
+
+    def test_opt_in_tiny_truncation_retains_only_complete_available_frames(self):
+        path, _ = self.wav(16000, [1000, -1000] * 160160, channels=2)
+        original = path.read_bytes()[:-7]
+        path.write_bytes(original)
+        metadata, pcm = decode_pcm16(path, allow_header_repair=True)
+        repair = metadata["container_repair"]
+        self.assertEqual("available_prefix", metadata["quality"])
+        self.assertEqual(160158, metadata["decoded_frames"])
+        self.assertEqual(160158 * 2, len(pcm))
+        self.assertEqual(2, repair["missing_declared_frames"])
+        self.assertEqual(7, repair["missing_declared_bytes"])
+        self.assertEqual(1, repair["dropped_partial_frame_bytes"])
+        self.assertFalse(repair["source_fully_present"])
+        self.assertEqual(original, path.read_bytes())
+
+    def test_opt_in_still_rejects_major_truncation(self):
+        path, _ = self.wav(16000, [1000] * 16000)
+        path.write_bytes(path.read_bytes()[:-1000])
+        for flag in (False, True):
+            with self.subTest(allow_header_repair=flag), self.assertRaises(ValueError):
+                decode_pcm16(path, allow_header_repair=flag)
+
 
 if __name__ == "__main__":
     unittest.main()
