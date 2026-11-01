@@ -7,7 +7,7 @@ deterministic streaming conversion commits quotas and duplicate checks serially.
 import argparse
 import base64
 from collections import Counter, deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 import hashlib
 import io
@@ -256,12 +256,13 @@ def prepare(config, candidates, output, *, workers=8):
             write_jsonl(output / "prepared_manifest.jsonl", manifest)
 
     source_order = deque(queues)
+    inflight_sources = set()
 
     def next_row():
         for _ in range(len(source_order)):
             source = source_order[0]
             source_order.rotate(-1)
-            if queues[source] and totals[source] < targets[source]:
+            if source not in inflight_sources and queues[source] and totals[source] < targets[source]:
                 return queues[source].popleft()
         return None
 
@@ -286,10 +287,16 @@ def prepare(config, candidates, output, *, workers=8):
                     row = next_row()
                     if row is None:
                         break
+                    inflight_sources.add(row["source_key"])
                     pending.append((row, pool.submit(prefetch, row)))
                 if not pending:
                     break
-                row, future = pending.popleft()
+                completed, _ = wait([future for _, future in pending], return_when=FIRST_COMPLETED)
+                # Preserve queued order among already completed transfers.
+                position = next(index for index, (_, future) in enumerate(pending) if future in completed)
+                row, future = pending[position]
+                del pending[position]
+                inflight_sources.remove(row["source_key"])
                 source, key = row["source_key"], _key(row)
                 raw, scratch, converting = None, None, False
                 try:
@@ -324,7 +331,8 @@ def prepare(config, candidates, output, *, workers=8):
                             clean_raw(raw, scratch)
                             continue
                         shard.parent.mkdir(parents=True, exist_ok=True)
-                        result.update(configuration_sha256=signature, tar_sha256=digest(temporary), tar_path=str(shard))
+                        result.update(configuration_sha256=signature, tar_sha256=digest(temporary), tar_path=str(shard),
+                                      selection_order=len(manifest), selected_at_utc=datetime.now(timezone.utc).isoformat())
                         os.replace(temporary, shard)
                         write_json(receipt_path, result)
                         hashes = {item["pcm_sha256"] for item in result["segments"]}
@@ -334,7 +342,9 @@ def prepare(config, candidates, output, *, workers=8):
                     totals[source] += result["selected_frames"]
                     manifest.append({"source_key": source, "source_id": row["source_id"], "tar_path": str(shard),
                                      "receipt_path": str(receipt_path), "segment_count": result["segment_count"],
-                                     "duration_seconds": result["duration_seconds"], "source": row})
+                                     "duration_seconds": result["duration_seconds"], "source": row,
+                                     "selection_order": result.get("selection_order"),
+                                     "selected_at_utc": result.get("selected_at_utc")})
                     progress["prepared_recordings"] += 1; progress["segments"] += result["segment_count"]
                     consecutive_errors = 0
                     checkpoint("running")
