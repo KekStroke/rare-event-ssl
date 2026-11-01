@@ -1,4 +1,4 @@
-# Copy with scripts/data/run_mls.sh to jobs/<job_id> and set script accordingly.
+# Copy with scripts/run_marine_ssl_data.sh to jobs/<job_id> and set script accordingly.
 job:
   description: rare-event-ssl quota-based marine corpus v1
   environment:
