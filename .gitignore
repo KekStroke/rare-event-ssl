@@ -28,3 +28,9 @@ archive/**/build.log
 archive/**/main.log
 expdb/__pycache__/
 beamng/
+
+.venv-data/
+
+*.egg-info/
+
+build/

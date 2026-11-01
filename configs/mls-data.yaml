@@ -1,0 +1,14 @@
+# Copy with scripts/data/run_mls.sh to jobs/<job_id> and set script accordingly.
+job:
+  description: rare-event-ssl quota-based marine corpus v1
+  environment:
+    image: cr.ai.cloud.ru/aicloud-base-images/py3.10-torch2.2.2:0.0.40
+  policy:
+    allocation_name: payg
+    internet_access: true
+    priority_class: medium
+  resource:
+    instance_type: cpu.2C.8G
+    workers: 1
+  script: /home/jovyan/iskhakov_anvar_local/jobs/marine_ssl_20261102/run_job.sh
+  type: binary

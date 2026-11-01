@@ -1,0 +1,91 @@
+schema_version: 1
+# Acquisition only. Keep original audio and annotations; do not infer test splits.
+datasets:
+  avacha:
+    kind: existing
+    source_family: avacha
+    status: requires_local_inventory
+    path: /mnt/shared_ru.ml.SZ-2_000180/Iskhakov/datasets/rare-event-ssl/2026-10-30/avacha_field
+    notes: Existing 17-field-recording collection; verify the saved validation summary.
+
+  animal_spot:
+    kind: existing
+    source_family: avacha
+    status: requires_local_inventory
+    path: /mnt/shared_ru.ml.SZ-2_000180/Iskhakov/datasets/rare-event-ssl/2026-10-30/animal_spot_trainingfiles
+    notes: Existing labeled short clips; do not silently redefine their species/classes.
+
+  onc_benchmark:
+    kind: hf
+    repo: DORI-SRKW/ONC-Benchmark
+    revision: 23cbf955541f4ed8e21107c6f0e04530ef9e2035
+    source_family: onc
+    license: CC-BY-4.0
+    source_page: https://huggingface.co/datasets/DORI-SRKW/ONC-Benchmark
+    notes: 386 metadata rows but only 385 published audio files; missing ICLISTENHF1353_20230731T235507.000Z.flac must remain reported. All published filenames also occur in DORI-ONC/test.
+
+  orcasound_hackathon2024:
+    kind: hf
+    repo: DORI-SRKW/orcasound_hackathon2024
+    revision: b5aefd514724650a4e21b117a0715e1baa7a746f
+    source_family: orcasound
+    license: CC-BY-NC-SA-4.0
+    source_page: https://huggingface.co/datasets/DORI-SRKW/orcasound_hackathon2024
+    notes: Reserve all source recordings/sessions before pretraining. Verify paths against metadata and check audio duplicates; preserve upstream splits.
+
+  beans_watkins:
+    kind: archive
+    source_family: watkins
+    url: https://storage.googleapis.com/ml-bioacoustics-datasets/watkins.zip
+    metadata_url: https://storage.googleapis.com/storage/v1/b/ml-bioacoustics-datasets/o/watkins.zip
+    license: Verify underlying Watkins collection conditions; retain upstream notices.
+    source_page: https://github.com/earthspecies/beans/blob/main/scripts/watkins.py
+    notes: Official BEANS excludes Weddell_Seal and generates 6:2:2 stratified splits with seed 42. Do not substitute the historical confit/wmms-parquet train/test split.
+
+  beans_hiceas:
+    kind: archive
+    source_family: hiceas
+    url: https://storage.googleapis.com/ml-bioacoustics-datasets/hiceas_1-20_minke-detection.zip
+    metadata_url: https://storage.googleapis.com/storage/v1/b/ml-bioacoustics-datasets/o/hiceas_1-20_minke-detection.zip
+    license: Verify archive notices and source data conditions.
+    source_page: https://github.com/earthspecies/beans/blob/main/scripts/download_data.sh
+    notes: Preserve supplied annotations and official 10-second window definition.
+
+  dominica:
+    kind: local_transfer
+    source_family: dominica
+    status: local_source_found_transfer_pending
+    path: /mnt/shared_ru.ml.SZ-2_000180/Iskhakov/datasets/rare-event-ssl/2026-11-02/benchmarks/dominica
+    source_page: https://ieee-dataport.org/documents/dominica-dataset
+    license: IEEE DataPort access terms; retain the authorized private research copy.
+    notes: Existing local collection found with 39 signal and 43 noise WAV files plus MAT/CSV annotations. Transfer originals and verify source SHA-256 receipts, decoding, durations, channels, and event times before use. No repeat IEEE download is required.
+
+  manual_sound_noise:
+    kind: local_transfer
+    source_family: watkins
+    status: requires_local_transfer_and_provenance_validation
+    notes: Transfer original audio, raw Label Studio JSON, annotations.csv, and existing pyannote lists/rttms/uems together. Resolve original recording IDs before evaluating; paper's approximately 15 hours is unverified.
+
+  voices_in_the_sea:
+    kind: voices_index
+    source_family: voices_in_the_sea
+    url: https://voicesinthesea.ucsd.edu/species/spectrogramPlayerComponents/audio/
+    source_page: https://voicesinthesea.ucsd.edu/
+    max_directories: 100
+    license: Reuse terms unconfirmed; keep private research copy and do not redistribute audio.
+    notes: Directory is public. Retain source links; audio examples may overlap other marine collections and need fingerprint/provenance checks if used in pretraining.
+
+  dclde2027_training:
+    kind: selected_manifest
+    source_family: dclde2027
+    status: audio_subset_not_selected
+    manifest: null
+    license: CC-BY-4.0
+    source_page: https://doi.org/10.25921/15ey-mh50
+    notes: Explicitly select and freeze a benchmark audio manifest before acquisition; no default full native-audio download. Preserve source recording/session IDs and exclude only the selected benchmark sources from pretraining. Renamed from DCLDE 2026; official challenge test is not available until 2027. Historical Windows paths in Annotations.csv are metadata, not local destinations.
+
+  orcasound_cross_deployment_holdout:
+    kind: split_definition
+    source_family: orcasound
+    status: annotated_holdout_not_defined
+    notes: Derived task, not a separate download. Freeze labeled deployment/session/year holdouts before enabling Orcasound pretraining.

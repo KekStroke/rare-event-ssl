@@ -69,3 +69,9 @@ Not included. Whale recordings and annotations are the MarineMammalBench field s
 ## Environment
 
 `requirements.txt` pins the versions recorded in `expdb/expdb.sqlite` (torch 2.11.0+cu128, Python 3.14, RTX 5090 Laptop GPU).
+
+## Marine Mammal SSL data
+
+Quota-based collection tools, source/session exclusions and Cloud.ru launch instructions
+are described in [docs/data.md](docs/data.md). Configuration is in `configs/`;
+the independent data package is in `src/marine_ssl/`.

@@ -1,0 +1,85 @@
+schema_version: 1
+seed: 20261102
+sample_rate: 16000
+channels: 1
+sample_format: PCM_16
+segment_seconds: 5
+overlap_seconds: 0
+per_record_max_seconds: 3600
+reserve_bytes: 400000000000
+output_root: /mnt/shared_ru.ml.SZ-2_000180/Iskhakov/datasets/rare-event-ssl/marine-ssl-v1
+# Quotas are goals, not verified availability. Decode and accumulate actual usable
+# duration in the collector; 300-second HF estimates must never mark data ready.
+# 1,600 h is 184.32 GB of sample bytes and 1,152,000 five-second windows.
+# Prefer reader-compatible shards instead of a million loose files.
+protected_catalogs:
+  - ONC-Benchmark.jsonl
+  - orcasound_hackathon2024.jsonl
+# Screen only the selected ONC-Benchmark and Hackathon recordings.
+# No external/reserve dataset or hypothetical future holdout is required.
+sources:
+  dori_onc:
+    source_family: onc
+    catalog: DORI-ONC.jsonl
+    repo: DORI-SRKW/DORI-ONC
+    revision: 0abd944798351c1e251dd4c37c25e5c86ee13d71
+    target_hours: 900
+    duration_estimate_seconds: 300
+    license: CC-BY-4.0
+  orcasound:
+    kind: s3
+    source_family: orcasound
+    catalog: orcasound.jsonl
+    hf_catalog: DORI-Orcasound.jsonl
+    repo: DORI-SRKW/DORI-Orcasound
+    hf_revision: 95b5e572b216c5e74eb5c73c204a2b7ef912aed2
+    target_hours: 300
+    license: CC-BY-NC-SA-4.0
+    # Additional cached acoustic-sandbox rows may augment this catalog after
+    # resolving original source identities. DORI is not a second audio source.
+    bucket: acoustic-sandbox
+    prefixes:
+      - 2017-09-05-SRKW/
+      - 2017-09-27_OS_SRKW-wav/
+      - 2019-11-14_PT_SRKW_HLS/
+      - 2020-06-26-SRKW-Lpod/
+      - orcasounds/
+      - wholistener/
+      - humpbacks/
+      - 2017_8_VesselsAndWavS/
+    excluded_prefixes:
+      - 2021_9_12_OS_YearsBestVocalPassby/
+  pacific_sound:
+    per_record_max_seconds: 21600
+    kind: s3
+    source_family: pacific_sound
+    catalog: pacific-sound-16khz.jsonl
+    target_hours: 250
+    bucket: pacific-sound-16khz
+    prefixes:
+      - 2018/11/
+      - 2019/01/
+      - 2020/09/
+    license: CC-BY-4.0
+    reuse_existing_first: true
+    # Cached catalogs must identify individual dated objects; avoid listing or
+    # downloading the full-resolution archive merely to meet a quota.
+  sanctsound:
+    kind: gcs
+    source_family: sanctsound
+    catalog: sanctsound.jsonl
+    target_hours: 150
+    bucket: noaa-passive-bioacoustic
+    source_page: https://doi.org/10.25921/saca-sp25
+    prefixes:
+      - sanctsound/audio/ci01/sanctsound_ci01_01/
+      - sanctsound/audio/ci01/sanctsound_ci01_04/
+      - sanctsound/audio/mb01/sanctsound_mb01_01/
+      - sanctsound/audio/mb01/sanctsound_mb01_05/
+      - sanctsound/audio/sb01/sanctsound_sb01_07/
+      - sanctsound/audio/sb01/sanctsound_sb01_08/
+      - sanctsound/audio/sb02/sanctsound_sb02_01/
+      - sanctsound/audio/sb02/sanctsound_sb02_03/
+      - sanctsound/audio/fk01/sanctsound_fk01_01/
+      - sanctsound/audio/fk01/sanctsound_fk01_03/
+    prefer_detection_products: sanctsound/products/detections/
