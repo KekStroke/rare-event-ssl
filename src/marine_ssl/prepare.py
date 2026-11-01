@@ -20,6 +20,7 @@ import subprocess
 import tarfile
 import tempfile
 import threading
+import time
 import uuid
 import wave
 
@@ -234,6 +235,26 @@ def prepare(config, candidates, output, *, workers=8):
 
     thread = threading.Thread(target=heartbeat, daemon=True); thread.start()
 
+    consecutive_errors = 0
+    last_checkpoint = time.monotonic()
+
+    def checkpoint(status, *, persist_issues=False):
+        nonlocal last_checkpoint
+        now = time.monotonic()
+        if not persist_issues and now - last_checkpoint < 60:
+            return
+        last_checkpoint = now
+        write_json(output / "preparation.json", {
+            "updated_utc": datetime.now(timezone.utc).isoformat(), "status": status,
+            "counts": dict(progress), "training_ready": False,
+            "sources": {key: {"actual_frames": totals[key], "actual_hours": totals[key] / rate / 3600,
+                              "target_hours": targets[key] / rate / 3600,
+                              "quota_met": totals[key] >= targets[key]} for key in targets},
+            "last_issue": issues[-1] if issues else None})
+        if persist_issues:
+            write_jsonl(output / "preparation_issues.jsonl", issues)
+            write_jsonl(output / "prepared_manifest.jsonl", manifest)
+
     source_order = deque(queues)
 
     def next_row():
@@ -270,6 +291,7 @@ def prepare(config, candidates, output, *, workers=8):
                     break
                 row, future = pending.popleft()
                 source, key = row["source_key"], _key(row)
+                raw, scratch, converting = None, None, False
                 try:
                     raw, scratch = future.result()
                     if totals[source] >= targets[source]:
@@ -293,7 +315,10 @@ def prepare(config, candidates, output, *, workers=8):
                         temporary_bytes = min(targets[source] - totals[source], int(effective["per_record_max_seconds"] * rate)) * 2
                         if shutil.disk_usage(output).free < reserve + temporary_bytes:
                             raise RuntimeError("Free-space reserve reached before conversion")
+                        converting = True
                         result, temporary = _convert(row, raw, work, targets[source] - totals[source], effective, seen_segments, seen_pcm)
+                        converting = False
+                        consecutive_errors = 0
                         if temporary is None:
                             issues.append({"source_key": source, "source_id": row["source_id"], **result})
                             clean_raw(raw, scratch)
@@ -311,13 +336,28 @@ def prepare(config, candidates, output, *, workers=8):
                                      "receipt_path": str(receipt_path), "segment_count": result["segment_count"],
                                      "duration_seconds": result["duration_seconds"], "source": row})
                     progress["prepared_recordings"] += 1; progress["segments"] += result["segment_count"]
+                    consecutive_errors = 0
+                    checkpoint("running")
                     clean_raw(raw, scratch)
                 except Exception as exc:
                     progress["errors"] += 1
-                    issues.append({"source_key": source, "source_id": row["source_id"], "status": "error",
-                                   "error": f"{type(exc).__name__}: {exc}"})
-                    # Keep failed source/partials for inspection; stopping keeps
-                    # retained raw files bounded by the prefetch worker count.
+                    consecutive_errors += 1
+                    isolated_decode_error = converting and isinstance(exc, (ValueError, KeyError, IndexError, subprocess.SubprocessError))
+                    issue = {"source_key": source, "source_id": row["source_id"], "status": "error",
+                             "error": f"{type(exc).__name__}: {exc}",
+                             "isolated_decode_error": isolated_decode_error,
+                             "consecutive_errors": consecutive_errors}
+                    issues.append(issue)
+                    # Persist before ThreadPoolExecutor waits for active HTTP transfers.
+                    print(json.dumps({"stage": "prepare_error", **issue}), flush=True)
+                    checkpoint("skipping_corrupt_audio" if isolated_decode_error else "stopping_after_error", persist_issues=True)
+                    if isolated_decode_error:
+                        clean_raw(raw, scratch)
+                        if consecutive_errors < 10:
+                            continue
+                    for _, pending_future in pending:
+                        pending_future.cancel()
+                    print(json.dumps({"stage": "waiting_for_prefetch_shutdown", "pending": len(pending)}), flush=True)
                     break
         summary = {"completed_utc": datetime.now(timezone.utc).isoformat(), "sources": {
             source: {"target_hours": targets[source] / rate / 3600, "actual_hours": totals[source] / rate / 3600,
