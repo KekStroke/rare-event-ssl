@@ -1,10 +1,12 @@
 """Prepare verified 16 kHz mono five-second WAVs in per-recording TAR shards.
 
 Run in an MLS CPU job. Workers prefetch a bounded number of original files;
-deterministic streaming conversion commits quotas and duplicate checks serially.
+bounded concurrent conversion uses one coordinator for ordered quota/dedup commits.
 """
 
 import argparse
+from contextlib import contextmanager
+from functools import lru_cache
 import base64
 from collections import Counter, deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -106,39 +108,90 @@ def _add(archive, name, value):
     archive.addfile(info, io.BytesIO(value))
 
 
-def _convert(row, raw, scratch, remaining_frames, config, seen_segments, seen_pcm):
+@lru_cache(maxsize=1)
+def _ffmpeg_version():
+    result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, check=True)
+    return result.stdout.splitlines()[0]
+
+
+@contextmanager
+def _pcm_blocks(raw, config):
+    """Full-source decode with bounded fast-path eligibility and streaming fallback."""
+    rate, width = config["sample_rate"], config["sample_rate"] * config["segment_seconds"] * 2
+    from .fast_audio import decode_pcm16
+    fast = decode_pcm16(raw, target_rate=rate, max_seconds=config.get("per_record_max_seconds", 3600))
+    if fast is not None:
+        metadata, pcm = fast
+        if pcm is not None:
+            yield metadata, (memoryview(pcm)[offset:offset + width] for offset in range(0, len(pcm), width))
+            return
+        if metadata.get("status") == "native_rate_below_target":
+            subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-xerror", "-i", str(raw),
+                            "-map", "0:a:0", "-f", "null", "-"], capture_output=True, check=True)
+            yield {**metadata, "full_decode_verified": True}, iter(())
+            return
     probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0",
-                            "-show_entries", "stream=sample_rate,channels:format=duration",
-                            "-of", "json", str(raw)], capture_output=True, text=True, check=True)
+                            "-show_entries", "stream=sample_rate,channels:format=duration", "-of", "json", str(raw)],
+                           capture_output=True, text=True, check=True)
     header = json.loads(probe.stdout)
     native = header["streams"][0]
-    if int(native["sample_rate"]) < config["sample_rate"]:
+    metadata = {"native": native, "backend": "ffmpeg", "versions": {"ffmpeg": _ffmpeg_version()},
+                "sample_rate_hz": rate, "channels": 1, "full_decode_verified": True}
+    if int(native["sample_rate"]) < rate:
         subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-xerror", "-i", str(raw),
                         "-map", "0:a:0", "-f", "null", "-"], capture_output=True, check=True)
-        return {"status": "native_rate_below_target", "native": native}, None
+        yield {**metadata, "status": "native_rate_below_target"}, iter(())
+        return
+    with tempfile.TemporaryFile() as errors:
+        process = subprocess.Popen(["ffmpeg", "-v", "error", "-nostdin", "-xerror", "-err_detect", "explode",
+                                    "-threads", "1", "-filter_threads", "1", "-i", str(raw), "-map", "0:a:0", "-vn",
+                                    "-ac", "1", "-ar", str(rate), "-c:a", "pcm_s16le", "-f", "s16le", "pipe:1"],
+                                   stdout=subprocess.PIPE, stderr=errors)
+        frames = 0
+        def blocks():
+            nonlocal frames
+            while True:
+                block = bytearray()
+                while len(block) < width:
+                    value = process.stdout.read(width - len(block))
+                    if not value:
+                        break
+                    block.extend(value)
+                if not block:
+                    return
+                if len(block) % 2:
+                    raise ValueError("Partial PCM16 sample")
+                frames += len(block) // 2
+                yield block
+        try:
+            yield metadata, blocks()
+            if process.wait() != 0:
+                errors.seek(0)
+                raise ValueError("ffmpeg full decode failed: " + errors.read(2048).decode(errors="replace"))
+            expected = float(header.get("format", {}).get("duration") or 0)
+            if not frames or (expected and abs(frames / rate - expected) > max(0.5, expected * 0.001)):
+                raise ValueError("Full decoded duration differs from source metadata")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdout.close()
+
+
+def _convert(row, raw, scratch, remaining_frames, config, seen_segments, seen_pcm):
     rate, window = config["sample_rate"], config["sample_rate"] * config["segment_seconds"]
     limit = min(remaining_frames, int(config.get("per_record_max_seconds", 3600) * rate))
     temporary = scratch / ("prepared." + uuid.uuid4().hex + ".tar.part")
-    selected, local_hashes, pcm_hash = [], set(), hashlib.sha256(b"16000:1:int16le\n")
-    decoded_frames, selected_frames, duplicate_windows = 0, 0, 0
-    with tempfile.TemporaryFile() as errors:
-        process = subprocess.Popen(["ffmpeg", "-v", "error", "-nostdin", "-xerror", "-err_detect", "explode",
-                                    "-threads", "1", "-i", str(raw), "-map", "0:a:0", "-vn",
-                                    "-ac", "1", "-ar", str(rate), "-c:a", "pcm_s16le", "-f", "s16le", "pipe:1"],
-                                   stdout=subprocess.PIPE, stderr=errors)
-        try:
+    selected, local_hashes = [], set()
+    pcm_hash = hashlib.sha256(b"16000:1:int16le\n")
+    decoded_frames = selected_frames = duplicate_windows = 0
+    try:
+        with _pcm_blocks(raw, config) as (metadata, blocks):
+            if metadata.get("status") == "native_rate_below_target":
+                return {"status": "native_rate_below_target", "native": metadata["native"],
+                        "decoder_backend": metadata["backend"], "decoder_versions": metadata.get("versions", {})}, None
             with tarfile.open(temporary, "w") as archive:
-                while True:
-                    block = bytearray()
-                    while len(block) < window * 2:
-                        data = process.stdout.read(window * 2 - len(block))
-                        if not data:
-                            break
-                        block.extend(data)
-                    if not block:
-                        break
-                    if len(block) % 2:
-                        raise ValueError("Partial PCM16 sample")
+                for block in blocks:
                     start = decoded_frames
                     decoded_frames += len(block) // 2
                     pcm_hash.update(block)
@@ -153,232 +206,332 @@ def _convert(row, raw, scratch, remaining_frames, config, seen_segments, seen_pc
                     _add(archive, name, _wav(block, rate))
                     selected.append({"member": name, "start_frame": start, "frames": window, "pcm_sha256": checksum})
                     selected_frames += window
-                if process.wait() != 0:
-                    errors.seek(0)
-                    raise ValueError("ffmpeg full decode failed: " + errors.read(2048).decode(errors="replace"))
-                expected = float(header.get("format", {}).get("duration") or 0)
-                if not decoded_frames or (expected and abs(decoded_frames / rate - expected) > max(0.5, expected * 0.001)):
-                    raise ValueError("Full decoded duration differs from source metadata")
+                if metadata.get("decoded_frames") is not None and decoded_frames != metadata["decoded_frames"]:
+                    raise ValueError("Decoded frame count differs from decoder metadata")
                 result = {"schema_version": VERSION, "status": "prepared", "source": row,
-                          "native": native, "source_sha256": digest(raw), "normalized_pcm_sha256": pcm_hash.hexdigest(),
-                          "decoded_frames": decoded_frames, "sample_rate_hz": rate, "channels": 1, "subtype": "PCM_16",
+                          "native": metadata["native"], "source_sha256": digest(raw),
+                          "normalized_pcm_sha256": pcm_hash.hexdigest(), "decoded_frames": decoded_frames,
+                          "sample_rate_hz": rate, "channels": 1, "subtype": "PCM_16",
                           "selected_frames": selected_frames, "duration_seconds": selected_frames / rate,
                           "segment_seconds": config["segment_seconds"], "segment_count": len(selected), "segments": selected,
                           "duplicate_windows_skipped": duplicate_windows, "dropped_tail_frames": decoded_frames % window,
-                          "per_record_max_seconds": config.get("per_record_max_seconds", 3600), "full_decode_verified": True,
-                          "ready_for_training": False}
+                          "per_record_max_seconds": config.get("per_record_max_seconds", 3600),
+                          "full_decode_verified": True, "ready_for_training": False,
+                          "decoder_backend": metadata["backend"], "decoder_versions": metadata.get("versions", {})}
                 _add(archive, "recording.json", (json.dumps(result, ensure_ascii=False) + "\n").encode())
-        except BaseException:
-            process.kill()
-            process.wait()
-            if temporary.exists():
-                temporary.unlink()
-            raise
-        finally:
-            process.stdout.close()
-    if pcm_hash.hexdigest() in seen_pcm or not selected:
-        temporary.unlink()  # Exact owned intermediate, never an existing source.
-        return {"status": "duplicate_or_no_complete_unique_windows", "source_id": row["source_id"]}, None
-    return result, temporary
+        if pcm_hash.hexdigest() in seen_pcm or not selected:
+            temporary.unlink()
+            return {"status": "duplicate_or_no_complete_unique_windows", "source_id": row["source_id"]}, None
+        return result, temporary
+    except BaseException:
+        if temporary.exists():
+            temporary.unlink()
+        raise
 
 
-def prepare(config, candidates, output, *, workers=8):
-    """Acquire until actual unique validated window counts reach source quotas."""
-    if not 1 <= workers <= 32:
-        raise ValueError("workers must be between 1 and 32")
+def _trim_shard(result, temporary, kept, *, duplicate_count, quota_count):
+    """Copy unchanged WAV entries only when coordinator exclusions require it."""
+    result = {**result, "segments": kept, "segment_count": len(kept),
+              "selected_frames": sum(segment["frames"] for segment in kept),
+              "coordinator_exclusions": {"global_duplicate_windows": duplicate_count,
+                                         "quota_trimmed_windows": quota_count}}
+    result["duration_seconds"] = result["selected_frames"] / result.get("sample_rate_hz", 16000)
+    trimmed = temporary.with_name("trimmed." + uuid.uuid4().hex + ".tar.part")
+    try:
+        with tarfile.open(temporary, "r") as source, tarfile.open(trimmed, "w") as target:
+            for segment in kept:
+                member = source.getmember(segment["member"])
+                with source.extractfile(member) as stream:
+                    target.addfile(member, stream)
+            _add(target, "recording.json", (json.dumps(result, ensure_ascii=False) + "\n").encode())
+        temporary.unlink()
+        return result, trimmed
+    except BaseException:
+        if trimmed.exists():
+            trimmed.unlink()
+        raise
+
+
+def prepare(config, candidates, output, *, workers=8, download_workers=None):
+    """Parallel bounded transfer/decode, with ordered serial quota/dedup commits."""
+    download_workers = workers if download_workers is None else download_workers
+    if not 1 <= workers <= 32 or not 1 <= download_workers <= 64:
+        raise ValueError("decode workers must be 1..32 and download workers 1..64")
     if (config["sample_rate"], config["channels"], config["sample_format"], config["segment_seconds"], config["overlap_seconds"]) != (16000, 1, "PCM_16", 5, 0):
-        raise ValueError("This preparer supports only mono PCM16/16kHz, non-overlapping 5s windows")
+        raise ValueError("Only mono PCM16/16kHz, non-overlapping five-second windows are supported")
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-        raise RuntimeError("ffmpeg and ffprobe must be installed in the MLS image")
-    output = Path(output).resolve()
-    output.mkdir(parents=True, exist_ok=True)
+        raise RuntimeError("ffmpeg and ffprobe are required in the MLS image")
+    output = Path(output).resolve(); output.mkdir(parents=True, exist_ok=True)
     signature, rate = _signature(config), config["sample_rate"]
+    window = rate * config["segment_seconds"]
     targets = {source: int(spec["target_hours"] * 3600 * rate) for source, spec in config["sources"].items()}
     if any(not re.fullmatch(r"[a-z0-9_-]+", source) for source in targets):
         raise ValueError("Unsafe source key")
-    queues = {source: deque() for source in targets}
-    unique = set()
+    rows_by_key, queues, identities = {}, {source: deque() for source in targets}, set()
     for row in candidates:
         source = row["source_key"]
-        identity = (source, row["source_id"])
-        if source not in queues or identity in unique:
+        if source not in queues:
             continue
-        if (row.get("clearance_scope") != "source_metadata_only"
-                or row.get("source_family") != config["sources"][source]["source_family"]):
+        identity = (row.get("source_family"), row.get("source_recording_id") or row["source_id"])
+        if identity in identities:
+            continue
+        if row.get("clearance_scope") != "source_metadata_only" or row.get("source_family") != config["sources"][source]["source_family"]:
             raise ValueError("Only planner-cleared pretrain candidates are accepted")
-        unique.add(identity)
-        queues[source].append(row)
-    reserve = int(config.get("reserve_bytes", 400_000_000_000))
-    largest = sorted((int(row.get("bytes", row.get("size")) or 0) for rows in queues.values() for row in rows), reverse=True)[:workers]
-    existing_frames = Counter()
-    for source, rows in queues.items():
-        for row in rows:
-            receipt = output / "receipts" / source / (_key(row) + ".json")
-            if receipt.is_file():
-                saved = json.loads(receipt.read_text(encoding="utf-8"))
-                if saved.get("configuration_sha256") == signature and _same_source(saved["source"], row):
-                    existing_frames[source] += saved["selected_frames"]
-    largest_cap = max(spec.get("per_record_max_seconds", config.get("per_record_max_seconds", 3600)) for spec in config["sources"].values())
-    required = sum(max(0, targets[key] - existing_frames[key]) for key in targets) * 2 + sum(largest) + workers * int(largest_cap * rate * 2)
-    if shutil.disk_usage(output).free < reserve + required:
-        raise RuntimeError(f"Capacity check failed: prepared+raw+temporary {required}, reserve {reserve}")
+        identities.add(identity); rows_by_key[(source, _key(row))] = row; queues[source].append(row)
     lockfile = output / ".prepare.lock"
-    lock = lockfile.open("x", encoding="utf-8")
-    lock.write(json.dumps({"pid": os.getpid(), "started_utc": datetime.now(timezone.utc).isoformat()})); lock.close()
-    progress, totals, seen_segments, seen_pcm, manifest, issues = Counter(), Counter(), set(), set(), [], []
-    stop = threading.Event()
+    with lockfile.open("x", encoding="utf-8") as stream:
+        stream.write(json.dumps({"pid": os.getpid(), "started_utc": datetime.now(timezone.utc).isoformat()}))
+    progress, totals, manifest, issues = Counter(), Counter(), [], []
+    seen_segments, seen_pcm, seen_raw = set(), set(), set()
+    stop, last_checkpoint = threading.Event(), 0.0
+    reserve = int(config.get("reserve_bytes", 400_000_000_000))
+    stage = "verify_existing"
 
-    def heartbeat():
-        while not stop.wait(60):
-            print(json.dumps({"utc": datetime.now(timezone.utc).isoformat(), "progress": dict(progress),
-                              "actual_hours": {key: totals[key] / rate / 3600 for key in targets}}), flush=True)
+    def summary(status):
+        return {"updated_utc": datetime.now(timezone.utc).isoformat(), "status": status,
+                "sources": {key: {"actual_frames": totals[key], "actual_hours": totals[key] / rate / 3600,
+                                  "target_hours": targets[key] / rate / 3600,
+                                  "quota_met": totals[key] >= targets[key]} for key in targets},
+                "counts": dict(progress), "decode_workers": workers, "download_workers": download_workers,
+                "training_ready": False, "last_issue": issues[-1] if issues else None}
 
-    thread = threading.Thread(target=heartbeat, daemon=True); thread.start()
-
-    consecutive_errors = 0
-    last_checkpoint = time.monotonic()
-
-    def checkpoint(status, *, persist_issues=False):
+    def checkpoint(status, force=False):
         nonlocal last_checkpoint
         now = time.monotonic()
-        if not persist_issues and now - last_checkpoint < 60:
+        if not force and now - last_checkpoint < 60:
             return
         last_checkpoint = now
-        write_json(output / "preparation.json", {
-            "updated_utc": datetime.now(timezone.utc).isoformat(), "status": status,
-            "counts": dict(progress), "training_ready": False,
-            "sources": {key: {"actual_frames": totals[key], "actual_hours": totals[key] / rate / 3600,
-                              "target_hours": targets[key] / rate / 3600,
-                              "quota_met": totals[key] >= targets[key]} for key in targets},
-            "last_issue": issues[-1] if issues else None})
-        if persist_issues:
+        write_json(output / "preparation.json", summary(status))
+        if force:
             write_jsonl(output / "preparation_issues.jsonl", issues)
             write_jsonl(output / "prepared_manifest.jsonl", manifest)
 
-    source_order = deque(queues)
-    inflight_sources = set()
+    def heartbeat():
+        while not stop.wait(60):
+            print(json.dumps({"stage": stage, **summary("running")}), flush=True)
 
-    def next_row():
-        for _ in range(len(source_order)):
-            source = source_order[0]
-            source_order.rotate(-1)
-            if source not in inflight_sources and queues[source] and totals[source] < targets[source]:
-                return queues[source].popleft()
-        return None
+    thread = threading.Thread(target=heartbeat, daemon=True); thread.start()
 
-    def prefetch(row):
-        receipt = output / "receipts" / row["source_key"] / (_key(row) + ".json")
-        return (None, None) if receipt.is_file() else _source(row, output, reserve)
-
-    def clean_raw(raw, scratch):
-        if scratch:
+    def clean_raw(task):
+        raw, scratch = task.get("raw"), task.get("scratch")
+        if raw is not None and scratch:
             for path in (raw, raw.with_name(raw.name + ".receipt.json")):
                 if path.is_file() and not path.is_symlink():
                     path.unlink()
 
-    print(json.dumps({"stage": "prepare", "workers": workers, "configuration_sha256": signature,
-                      "target_hours": {key: value / rate / 3600 for key, value in targets.items()},
-                      "required_bytes_upper_estimate": required, "training_ready": False}), flush=True)
+    def paths(row):
+        source, key = row["source_key"], _key(row)
+        return output / "shards" / source / (key + ".tar"), output / "receipts" / source / (key + ".json")
+
+    def add_committed(row, result, shard, receipt, reused=False):
+        hashes = {segment["pcm_sha256"] for segment in result["segments"]}
+        if hashes & seen_segments or result["normalized_pcm_sha256"] in seen_pcm:
+            raise ValueError("Existing prepared artifacts overlap; preserve and inspect")
+        if result["selected_frames"] > targets[row["source_key"]] - totals[row["source_key"]]:
+            raise ValueError("Existing receipt exceeds remaining quota; preserve and inspect")
+        seen_segments.update(hashes); seen_pcm.add(result["normalized_pcm_sha256"])
+        if result.get("source_sha256"):
+            seen_raw.add(result["source_sha256"])
+        totals[row["source_key"]] += result["selected_frames"]
+        manifest.append({"source_key": row["source_key"], "source_id": row["source_id"],
+                         "tar_path": str(shard), "receipt_path": str(receipt), "source": row,
+                         "segment_count": result["segment_count"], "duration_seconds": result["duration_seconds"],
+                         "decoder_backend": result.get("decoder_backend", "ffmpeg"),
+                         "decoder_versions": result.get("decoder_versions", {"ffmpeg": "legacy-unrecorded"}),
+                         "selection_order": result.get("selection_order"), "selected_at_utc": result.get("selected_at_utc")})
+        progress["prepared_recordings"] += 1; progress["segments"] += result["segment_count"]
+        progress["reused_recordings" if reused else "new_recordings"] += 1
+        checkpoint("running")
+
+    def verify_existing(item):
+        row, receipt = item
+        shard, expected = paths(row)
+        result = json.loads(receipt.read_text(encoding="utf-8"))
+        if receipt != expected or result.get("configuration_sha256") != signature or not _same_source(result["source"], row):
+            raise ValueError("Existing prepared receipt is incompatible; preserve and inspect")
+        if not shard.is_file() or digest(shard) != result.get("tar_sha256"):
+            raise ValueError("Existing prepared TAR is missing or corrupt; preserve and inspect")
+        if (len(result["segments"]) != result["segment_count"]
+                or sum(segment.get("frames", window) for segment in result["segments"]) != result["selected_frames"]):
+            raise ValueError("Existing receipt frame/segment counts differ")
+        return row, result, shard, receipt
+
+    def decode_task(task):
+        row, raw = task["row"], task["raw"]
+        shard, receipt = paths(row)
+        if shard.exists() or receipt.exists():
+            raise ValueError("Unclaimed prepared artifact exists; preserve and inspect")
+        (output / ".scratch").mkdir(exist_ok=True)
+        work = task["scratch"] or Path(tempfile.mkdtemp(prefix="prepare-", dir=output / ".scratch"))
+        effective = {**config, "per_record_max_seconds": config["sources"][row["source_key"]].get(
+            "per_record_max_seconds", config.get("per_record_max_seconds", 3600))}
+        record_frames = int(effective["per_record_max_seconds"] * rate)
+        allowance = record_frames * 2
+        if shutil.disk_usage(output).free < reserve + allowance:
+            raise RuntimeError("Free-space reserve reached before conversion")
+        try:
+            result, temporary = _convert(row, raw, work, record_frames, effective, frozenset(), frozenset())
+            return {"result": result, "temporary": temporary}
+        except (ValueError, KeyError, IndexError, subprocess.SubprocessError) as exc:
+            return {"error": exc, "isolated_decode_error": True}
+
+    def commit(task, outcome):
+        result, temporary, row = outcome["result"], outcome["temporary"], task["row"]
+        if temporary is None:
+            issues.append({"source_key": row["source_key"], "source_id": row["source_id"], **result})
+            clean_raw(task); progress[result["status"]] += 1
+            return
+        duplicate_pcm = result["normalized_pcm_sha256"] in seen_pcm or (
+            result.get("source_sha256") and result["source_sha256"] in seen_raw)
+        remaining = targets[row["source_key"]] - totals[row["source_key"]]
+        kept, duplicate_count, quota_count, kept_frames, local = [], 0, 0, 0, set()
+        for segment in result["segments"]:
+            checksum, frames = segment["pcm_sha256"], segment.get("frames", window)
+            if duplicate_pcm or checksum in seen_segments or checksum in local:
+                duplicate_count += 1; continue
+            if kept_frames + frames > remaining:
+                quota_count += 1; continue
+            kept.append(segment); kept_frames += frames; local.add(checksum)
+        if not kept:
+            temporary.unlink(); clean_raw(task)
+            progress["duplicate_or_quota_discarded"] += 1
+            return
+        if len(kept) != len(result["segments"]):
+            result, temporary = _trim_shard(result, temporary, kept, duplicate_count=duplicate_count, quota_count=quota_count)
+        else:
+            result["coordinator_exclusions"] = {"global_duplicate_windows": 0, "quota_trimmed_windows": 0}
+        shard, receipt = paths(row); shard.parent.mkdir(parents=True, exist_ok=True)
+        result.update(configuration_sha256=signature, tar_sha256=digest(temporary), tar_path=str(shard),
+                      selection_order=len(manifest), candidate_sequence=task["sequence"],
+                      selected_at_utc=datetime.now(timezone.utc).isoformat())
+        result.setdefault("decoder_backend", "ffmpeg")
+        result.setdefault("decoder_versions", {"ffmpeg": "legacy-unrecorded"})
+        os.replace(temporary, shard); write_json(receipt, result)
+        add_committed(row, result, shard, receipt); clean_raw(task)
+
+    print(json.dumps({"stage": "prepare", "configuration_sha256": signature, "decode_workers": workers,
+                      "download_workers": download_workers, "training_ready": False}), flush=True)
     try:
+        existing = []
+        for source in targets:
+            directory = output / "receipts" / source
+            if directory.is_dir():
+                for receipt in sorted(directory.glob("*.json")):
+                    row = rows_by_key.get((source, receipt.stem))
+                    if row is not None:
+                        existing.append((row, receipt))
+        reused_keys = set()
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            pending = deque()
+            for row, result, shard, receipt in pool.map(verify_existing, existing):
+                add_committed(row, result, shard, receipt, reused=True)
+                reused_keys.add((row["source_key"], _key(row)))
+        for source in queues:
+            queues[source] = deque(row for row in queues[source] if (source, _key(row)) not in reused_keys)
+        largest = sorted((int(row.get("bytes", row.get("size")) or 0) for rows in queues.values() for row in rows), reverse=True)[:download_workers + workers]
+        largest_cap = max(spec.get("per_record_max_seconds", config.get("per_record_max_seconds", 3600)) for spec in config["sources"].values())
+        required = sum(max(0, targets[key] - totals[key]) for key in targets) * 2 + sum(largest) + workers * int(largest_cap * rate * 2)
+        if shutil.disk_usage(output).free < reserve + required:
+            raise RuntimeError(f"Capacity check failed: remaining prepared/raw/temp {required}, reserve {reserve}")
+        stage = "parallel_prepare"
+        max_active = int(config.get("max_inflight_records", download_workers + workers))
+        heavy_limit = int(config.get("heavy_download_workers_per_source", 2))
+        heavy_bytes = int(config.get("heavy_source_bytes", 256 * 1024 ** 2))
+        active, downloads, decodes, raw_ready = {}, {}, {}, deque()
+        ready = {source: {} for source in targets}
+        admitted, expected, inflight, heavy = Counter(), Counter(), Counter(), Counter()
+        source_order, serial = deque(targets), 0
+        consecutive_errors, abort = 0, False
+
+        def release(task):
+            active.pop(task["id"], None); source = task["row"]["source_key"]
+            inflight[source] -= 1
+            if task["heavy"]: heavy[source] -= 1
+
+        def next_row():
+            available = [key for key in source_order if queues[key] and totals[key] < targets[key]
+                         and (int(queues[key][0].get("bytes", queues[key][0].get("size")) or 0) < heavy_bytes or heavy[key] < heavy_limit)]
+            if not available: return None
+            source = min(available, key=lambda key: inflight[key])
+            while source_order[0] != source: source_order.rotate(-1)
+            source_order.rotate(-1)
+            return queues[source].popleft()
+
+        with ThreadPoolExecutor(max_workers=download_workers) as transfers, ThreadPoolExecutor(max_workers=workers) as converters:
             while True:
-                while len(pending) < workers:
+                while len(downloads) < download_workers and len(active) < max_active and not abort:
                     row = next_row()
-                    if row is None:
-                        break
-                    inflight_sources.add(row["source_key"])
-                    pending.append((row, pool.submit(prefetch, row)))
-                if not pending:
-                    break
-                completed, _ = wait([future for _, future in pending], return_when=FIRST_COMPLETED)
-                # Preserve queued order among already completed transfers.
-                position = next(index for index, (_, future) in enumerate(pending) if future in completed)
-                row, future = pending[position]
-                del pending[position]
-                inflight_sources.remove(row["source_key"])
-                source, key = row["source_key"], _key(row)
-                raw, scratch, converting = None, None, False
-                try:
-                    raw, scratch = future.result()
+                    if row is None: break
+                    source = row["source_key"]
+                    task = {"id": serial, "row": row, "sequence": admitted[source],
+                            "heavy": int(row.get("bytes", row.get("size")) or 0) >= heavy_bytes}
+                    serial += 1; admitted[source] += 1; inflight[source] += 1
+                    if task["heavy"]: heavy[source] += 1
+                    active[task["id"]] = task
+                    downloads[transfers.submit(_source, row, output, reserve)] = task
+                while raw_ready and len(decodes) < workers and not abort:
+                    task = raw_ready.popleft(); source = task["row"]["source_key"]
                     if totals[source] >= targets[source]:
-                        continue  # Retain bounded prefetched scratch for a future run.
-                    shard = output / "shards" / source / (key + ".tar")
-                    receipt_path = output / "receipts" / source / (key + ".json")
-                    if receipt_path.exists():
-                        result = json.loads(receipt_path.read_text(encoding="utf-8"))
-                        if (result.get("configuration_sha256") != signature or not _same_source(result["source"], row)
-                                or not shard.is_file() or digest(shard) != result.get("tar_sha256")):
-                            raise ValueError("Existing prepared artifact is incompatible or corrupt; preserve and inspect")
-                        hashes = {item["pcm_sha256"] for item in result["segments"]}
-                        if hashes & seen_segments or result["normalized_pcm_sha256"] in seen_pcm:
-                            raise ValueError("Existing prepared artifacts overlap; preserve and inspect")
+                        ready[source][task["sequence"]] = (task, {"skipped_after_quota": True})
                     else:
-                        if shard.exists():
-                            raise ValueError("Existing TAR lacks receipt; preserve and inspect")
-                        (output / ".scratch").mkdir(exist_ok=True)
-                        work = scratch or Path(tempfile.mkdtemp(prefix="prepare-", dir=output / ".scratch"))
-                        effective = {**config, "per_record_max_seconds": config["sources"][source].get("per_record_max_seconds", config.get("per_record_max_seconds", 3600))}
-                        temporary_bytes = min(targets[source] - totals[source], int(effective["per_record_max_seconds"] * rate)) * 2
-                        if shutil.disk_usage(output).free < reserve + temporary_bytes:
-                            raise RuntimeError("Free-space reserve reached before conversion")
-                        converting = True
-                        result, temporary = _convert(row, raw, work, targets[source] - totals[source], effective, seen_segments, seen_pcm)
-                        converting = False
-                        consecutive_errors = 0
-                        if temporary is None:
-                            issues.append({"source_key": source, "source_id": row["source_id"], **result})
-                            clean_raw(raw, scratch)
-                            continue
-                        shard.parent.mkdir(parents=True, exist_ok=True)
-                        result.update(configuration_sha256=signature, tar_sha256=digest(temporary), tar_path=str(shard),
-                                      selection_order=len(manifest), selected_at_utc=datetime.now(timezone.utc).isoformat())
-                        os.replace(temporary, shard)
-                        write_json(receipt_path, result)
-                        hashes = {item["pcm_sha256"] for item in result["segments"]}
-                    if result["selected_frames"] > targets[source] - totals[source]:
-                        raise ValueError("Existing receipt exceeds remaining quota; use a compatible output version")
-                    seen_segments.update(hashes); seen_pcm.add(result["normalized_pcm_sha256"])
-                    totals[source] += result["selected_frames"]
-                    manifest.append({"source_key": source, "source_id": row["source_id"], "tar_path": str(shard),
-                                     "receipt_path": str(receipt_path), "segment_count": result["segment_count"],
-                                     "duration_seconds": result["duration_seconds"], "source": row,
-                                     "selection_order": result.get("selection_order"),
-                                     "selected_at_utc": result.get("selected_at_utc")})
-                    progress["prepared_recordings"] += 1; progress["segments"] += result["segment_count"]
-                    consecutive_errors = 0
-                    checkpoint("running")
-                    clean_raw(raw, scratch)
-                except Exception as exc:
-                    progress["errors"] += 1
-                    consecutive_errors += 1
-                    isolated_decode_error = converting and isinstance(exc, (ValueError, KeyError, IndexError, subprocess.SubprocessError))
-                    issue = {"source_key": source, "source_id": row["source_id"], "status": "error",
-                             "error": f"{type(exc).__name__}: {exc}",
-                             "isolated_decode_error": isolated_decode_error,
-                             "consecutive_errors": consecutive_errors}
-                    issues.append(issue)
-                    # Persist before ThreadPoolExecutor waits for active HTTP transfers.
-                    print(json.dumps({"stage": "prepare_error", **issue}), flush=True)
-                    checkpoint("skipping_corrupt_audio" if isolated_decode_error else "stopping_after_error", persist_issues=True)
-                    if isolated_decode_error:
-                        clean_raw(raw, scratch)
-                        if consecutive_errors < 10:
-                            continue
-                    for _, pending_future in pending:
-                        pending_future.cancel()
-                    print(json.dumps({"stage": "waiting_for_prefetch_shutdown", "pending": len(pending)}), flush=True)
+                        decodes[converters.submit(decode_task, task)] = task
+                for source in targets:
+                    while expected[source] in ready[source] and not abort:
+                        task, outcome = ready[source].pop(expected[source]); expected[source] += 1
+                        if "error" in outcome:
+                            exc = outcome["error"]; consecutive_errors += 1; progress["errors"] += 1
+                            issue = {"source_key": source, "source_id": task["row"]["source_id"],
+                                     "error": f"{type(exc).__name__}: {exc}", "status": "error",
+                                     "isolated_decode_error": outcome.get("isolated_decode_error", False)}
+                            issues.append(issue); print(json.dumps({"stage": "prepare_error", **issue}), flush=True)
+                            checkpoint("error", force=True)
+                            if issue["isolated_decode_error"]: clean_raw(task)
+                            if not issue["isolated_decode_error"] or consecutive_errors >= 10: abort = True
+                        elif not outcome.get("skipped_after_quota"):
+                            try:
+                                commit(task, outcome); consecutive_errors = 0
+                            except Exception as exc:
+                                progress["errors"] += 1
+                                issue = {"source_key": source, "source_id": task["row"]["source_id"],
+                                         "status": "commit_error", "error": f"{type(exc).__name__}: {exc}"}
+                                issues.append(issue)
+                                print(json.dumps({"stage": "prepare_error", **issue}), flush=True)
+                                checkpoint("commit_error", force=True)
+                                abort = True
+                        release(task)
+                if abort:
+                    for future in list(downloads) + list(decodes): future.cancel()
+                    print(json.dumps({"stage": "waiting_for_prefetch_shutdown", "downloads": len(downloads), "decodes": len(decodes)}), flush=True)
                     break
-        summary = {"completed_utc": datetime.now(timezone.utc).isoformat(), "sources": {
-            source: {"target_hours": targets[source] / rate / 3600, "actual_hours": totals[source] / rate / 3600,
-                     "actual_frames": totals[source], "quota_met": totals[source] >= targets[source]} for source in targets},
-            "counts": dict(progress), "training_ready": False,
-            "notes": "Exact PCM/chunk dedup only; retain the source/session exclusions and unresolved benchmark protocol blockers."}
-        write_jsonl(output / "prepared_manifest.jsonl", manifest)
-        write_jsonl(output / "preparation_issues.jsonl", issues)
-        write_json(output / "preparation.json", summary)
-        print(json.dumps(summary), flush=True)
-        return summary
+                pending = list(downloads) + list(decodes)
+                if not pending:
+                    if raw_ready: continue
+                    if not active: break
+                    raise RuntimeError("Ordered commit pipeline cannot make progress")
+                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in sorted(completed, key=lambda item: (downloads.get(item) or decodes[item])["id"]):
+                    if future in downloads:
+                        task = downloads.pop(future)
+                        try:
+                            task["raw"], task["scratch"] = future.result(); raw_ready.append(task)
+                            progress["downloaded_recordings"] += 1
+                        except Exception as exc:
+                            ready[task["row"]["source_key"]][task["sequence"]] = (task, {"error": exc})
+                    else:
+                        task = decodes.pop(future)
+                        try: outcome = future.result()
+                        except Exception as exc: outcome = {"error": exc}
+                        ready[task["row"]["source_key"]][task["sequence"]] = (task, outcome)
+                checkpoint("running")
+        result = summary("complete" if all(totals[key] >= targets[key] for key in targets) else "incomplete")
+        result["completed_utc"] = datetime.now(timezone.utc).isoformat()
+        checkpoint(result["status"], force=True); write_json(output / "preparation.json", result)
+        print(json.dumps(result), flush=True)
+        return result
+    except BaseException as exc:
+        issues.append({"status": "fatal_error", "error": f"{type(exc).__name__}: {exc}"})
+        print(json.dumps({"stage": "prepare_error", **issues[-1]}), flush=True)
+        checkpoint("fatal_error", force=True)
+        raise
     finally:
         stop.set(); thread.join(timeout=1); lockfile.unlink()
 
@@ -388,10 +541,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("config", "candidates", "output"):
         parser.add_argument("--" + name, required=True)
-    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--workers", type=int, default=8, help="Concurrent decoders")
+    parser.add_argument("--download-workers", type=int, help="Concurrent transfers; defaults to --workers")
     args = parser.parse_args()
-    summary = prepare(yaml.safe_load(Path(args.config).read_text(encoding="utf-8")), read_jsonl(args.candidates), args.output, workers=args.workers)
-    return int(not all(source["quota_met"] for source in summary["sources"].values()))
+    result = prepare(yaml.safe_load(Path(args.config).read_text(encoding="utf-8")), read_jsonl(args.candidates),
+                     args.output, workers=args.workers, download_workers=args.download_workers)
+    return int(not all(source["quota_met"] for source in result["sources"].values()))
 
 
 if __name__ == "__main__":

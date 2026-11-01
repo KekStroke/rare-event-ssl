@@ -2,12 +2,14 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import unittest
 from unittest.mock import patch
 
 import requests
 
-from marine_ssl.io import download
+from marine_ssl.io import client, download
 
 
 def sha(data):
@@ -44,6 +46,15 @@ class Session:
         return next(self.responses)
 
 
+class PooledSession(Session):
+    def __init__(self, *responses):
+        super().__init__(*responses)
+        self.headers, self.adapters = {}, {}
+
+    def mount(self, prefix, adapter):
+        self.adapters[prefix] = adapter
+
+
 class TransferTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -54,6 +65,44 @@ class TransferTests(unittest.TestCase):
         patcher = patch("marine_ssl.io.time.sleep")
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def test_cached_default_session_resumes_then_downloads_without_range_leakage(self):
+        self.part.write_bytes(b"abc")
+        session = PooledSession(
+            Response(b"def", status=206, headers={"Content-Range": "bytes 3-5/6"}),
+            Response(b"xyz", headers={"Content-Length": "3"}))
+        other = self.path.with_name("other.wav")
+        with patch("marine_ssl.io._clients", threading.local()), \
+                patch("marine_ssl.io.requests.Session", return_value=session) as factory:
+            download("https://example/first", self.path, size=6, sha256=sha(b"abcdef"))
+            download("https://example/second", other, size=3, sha256=sha(b"xyz"))
+        self.assertEqual(1, factory.call_count)
+        self.assertEqual(b"abcdef", self.path.read_bytes())
+        self.assertEqual(b"xyz", other.read_bytes())
+        self.assertEqual("bytes=3-", session.calls[0]["headers"]["Range"])
+        self.assertNotIn("Range", session.calls[1]["headers"])
+        self.assertNotIn("Range", session.headers)
+        self.assertNotIn("If-Range", session.headers)
+
+    def test_default_clients_are_reused_within_but_isolated_between_threads(self):
+        barrier = threading.Barrier(2)
+
+        def worker():
+            first = client()
+            barrier.wait(timeout=5)
+            return first, client()
+
+        with patch("marine_ssl.io._clients", threading.local()), \
+                patch("marine_ssl.io.requests.Session", side_effect=PooledSession) as factory:
+            main_client = client()
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(worker) for _ in range(2)]
+                pairs = [future.result(timeout=10) for future in futures]
+            self.assertIs(main_client, client())
+        for first, second in pairs:
+            self.assertIs(first, second)
+        self.assertEqual(3, len({id(main_client), *(id(pair[0]) for pair in pairs)}))
+        self.assertEqual(3, factory.call_count)
 
     def test_expected_sha_overrides_old_receipt(self):
         self.path.write_bytes(b"old")

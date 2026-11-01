@@ -5,6 +5,7 @@ import json
 import os
 import re
 import time
+import threading
 from pathlib import Path
 
 import requests
@@ -12,13 +13,23 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
+_clients = threading.local()
+
+
 def client():
-    session = requests.Session()
-    session.mount("https://", HTTPAdapter(max_retries=Retry(
-        total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "HEAD"], respect_retry_after_header=True)))
-    session.headers["User-Agent"] = "rare-event-ssl-data/0.1 (research acquisition)"
-    return session
+    """Reuse one bounded connection pool per calling thread and process."""
+    pid = os.getpid()
+    if getattr(_clients, "pid", None) != pid or not hasattr(_clients, "session"):
+        session = requests.Session()
+        session.mount("https://", HTTPAdapter(
+            pool_connections=4, pool_maxsize=2, pool_block=True,
+            max_retries=Retry(total=5, backoff_factor=1,
+                              status_forcelist=[429, 500, 502, 503, 504],
+                              allowed_methods=["GET", "HEAD"],
+                              respect_retry_after_header=True)))
+        session.headers["User-Agent"] = "rare-event-ssl-data/0.1 (research acquisition)"
+        _clients.session, _clients.pid = session, pid
+    return _clients.session
 
 
 def write_json(path, value):

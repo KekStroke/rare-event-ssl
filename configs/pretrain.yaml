@@ -7,6 +7,7 @@ segment_seconds: 5
 overlap_seconds: 0
 per_record_max_seconds: 3600
 reserve_bytes: 400000000000
+heavy_download_workers_per_source: 4
 output_root: /mnt/shared_ru.ml.SZ-2_000180/Iskhakov/datasets/rare-event-ssl/marine-ssl-v1
 # Quotas are goals, not verified availability. Decode and accumulate actual usable
 # duration in the collector; 300-second HF estimates must never mark data ready.

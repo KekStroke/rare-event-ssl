@@ -60,6 +60,6 @@ class PrepareSchedulingTests(unittest.TestCase):
                 summary = prepare_module.prepare(config, rows, output, workers=2)
             receipts = [json.loads(path.read_text()) for path in (output / "receipts").glob("*/*.json")]
         self.assertEqual(slow_observed, [True], "ready NOAA conversion was blocked by slow MBARI")
-        self.assertEqual(maximum, {"mbari": 1, "noaa": 1})
+        self.assertTrue(all(value <= 2 for value in maximum.values()))
         self.assertTrue(all(source["quota_met"] for source in summary["sources"].values()))
         self.assertEqual(sorted(row["selection_order"] for row in receipts), list(range(4)))
