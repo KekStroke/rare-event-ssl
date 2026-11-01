@@ -13,7 +13,7 @@ import re
 
 from .io import read_jsonl, write_json
 from .leakage import ExclusionIndex, canonical_family
-from .planning import _provenance
+from .planning import _provenance, legacy_year_is_separated, selected_orcasound_test_years
 from .sources import recording_identity
 
 
@@ -25,6 +25,9 @@ def _original(row, duration=None):
     result = dict(row)
     family = canonical_family(result.get("source_family"))
     result["source_family"] = family
+    if result.get("time_basis") == "unspecified_local_clock":
+        result.pop("recording_start_utc", None)
+        result.pop("recording_end_utc", None)
     if family in {"onc", "orcasound"} and not result.get("session_id"):
         name = result.get("relative_path") or result.get("path_in_source") or result.get("source_id", "")
         identity = recording_identity(family, str(name))
@@ -118,14 +121,19 @@ def audit_manifests(prepared_manifest, benchmark_manifests, catalog_dir):
             frames, rate = receipt.get("decoded_frames"), receipt.get("sample_rate_hz")
             prepared.append(_original(source, frames / rate if frames and rate else None))
     index = ExclusionIndex(protected)
+    selected_test_years = selected_orcasound_test_years(protected)
     counts, examples = Counter(), []
     for row in prepared:
-        reasons = index.reasons(row)
+        reasons = set(index.reasons(row))
+        if (row.get("source_family") == "orcasound"
+                and row.get("time_basis") == "unspecified_local_clock"
+                and not legacy_year_is_separated(row.get("legacy_calendar_year"), selected_test_years)):
+            reasons.update({"unresolved_pretrain_provenance", "legacy_year_not_separated_from_selected_tests"})
         if reasons:
             counts.update(reasons)
             if len(examples) < 25:
                 examples.append({"source_family": row.get("source_family"),
-                                 "source_id": row.get("source_id"), "reasons": list(reasons)})
+                                 "source_id": row.get("source_id"), "reasons": sorted(reasons)})
     active = {row.get("source_family") for row in prepared}
     unresolved = sorted(index.unresolved_families & active)
     uncertain = any(reason.startswith("unresolved_") or reason in {"invalid_provenance", "unknown_source_family"} for reason in counts)

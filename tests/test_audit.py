@@ -54,6 +54,22 @@ class ActualManifestAuditTests(unittest.TestCase):
         missing = audit_manifests(prepared, [benchmark, self.root / "missing.jsonl"], self.root)
         self.assertIn(str(self.root / "missing.jsonl"), missing["missing_manifests"])
 
+    def test_legacy_clock_requires_separation_from_actual_selected_test_years(self):
+        benchmark = self.write("selected.jsonl", [{"dataset": "orcasound_hackathon2024",
+                   "source_family": "orcasound", "source_id": "known-test",
+                   "session_id": "orcasound:20170601", "role": "audio", "full_decode_verified": True,
+                   "sha256": "b" * 64}])
+        for year, expected in ((2017, "partial"), (2018, "partial"), (2009, "metadata_clear")):
+            with self.subTest(year=year):
+                prepared = self.prepared({"source_family": "orcasound", "source_id": f"legacy-{year}",
+                    "session_id": f"orcasound-legacy:{year}0601", "legacy_calendar_year": year,
+                    "time_basis": "unspecified_local_clock", "recording_local_time": f"{year}-06-01T12:00:00"})
+                result = audit_manifests(prepared, [benchmark], self.root)
+                self.assertEqual(expected, result["status"])
+                self.assertEqual(expected == "metadata_clear", result["metadata_clear"])
+                if expected == "partial":
+                    self.assertIn("legacy_year_not_separated_from_selected_tests", result["overlap_reason_counts"])
+
 
 if __name__ == "__main__":
     unittest.main()

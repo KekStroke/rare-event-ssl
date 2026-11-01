@@ -14,6 +14,51 @@ from .leakage import ExclusionIndex
 from .sources import AUDIO_SUFFIXES, gcs_catalog, s3_catalog, recording_identity
 
 
+def legacy_calendar_identity(row):
+    """Preserve explicit legacy calendar time without claiming a UTC clock."""
+    name = str(row.get("path_in_source") or "")
+    if not name.startswith(("wholistener/", "orcasounds/")):
+        return row
+    match = re.search(r"(?:^|_)(\d{1,2})_(\d{1,2})_(20\d{2})_(\d{2})_(\d{2})_(\d{2})", Path(name).name)
+    if not match:
+        return row
+    month, day, year, hour, minute, second = map(int, match.groups())
+    try:
+        local = datetime(year, month, day, hour, minute, second)
+    except ValueError:
+        return row
+    result = {key: value for key, value in row.items()
+              if key not in {"recording_start_utc", "recording_end_utc"}}
+    station = re.search(r"(?:^|/)wholistener/(lk|os|bp|pt)(?:/|$)", name, re.I)
+    station = station[1].lower() if station else "all-stations"
+    result.update(source_recording_id=f"orcasound-legacy:{station}:{local.isoformat()}",
+                  time_basis="unspecified_local_clock", recording_local_time=local.isoformat(),
+                  recording_local_date=local.date().isoformat(), legacy_calendar_year=year,
+                  session_id=f"orcasound-legacy:{local:%Y%m%d}",
+                  identity_evidence="explicit_legacy_month_day_year_filename")
+    return result
+
+
+def legacy_year_is_separated(year, selected_test_years):
+    """Unknown test coverage and same/adjacent years cannot clear a local clock."""
+    return (isinstance(year, int) and not isinstance(year, bool)
+            and bool(selected_test_years)
+            and all(isinstance(other, int) and abs(year - other) >= 2 for other in selected_test_years))
+
+
+def selected_orcasound_test_years(protected):
+    years = set()
+    for row in protected:
+        if row.get("source_family") != "orcasound":
+            continue
+        session = str(_provenance(row).get("session_id") or "")
+        match = re.fullmatch(r"orcasound:(20\d{2})\d{4}", session)
+        if not match:
+            return None  # Any unresolved selected-test year blocks this shortcut.
+        years.add(int(match[1]))
+    return years or None
+
+
 def object_catalog(spec, *, session=None):
     """Explicit MLS-only metadata enumeration for configured S3/GCS prefixes."""
     bucket, kind = spec["bucket"], spec["kind"]
@@ -101,6 +146,7 @@ def build_plan(config, catalog_dir, *, protected_manifest=None):
     if missing:
         for family in ("onc", "orcasound"):
             protected.append({"source_family": family, "source_id": "missing-required-protected-catalog"})
+    selected_test_years = selected_orcasound_test_years(protected)
     index = ExclusionIndex(protected, at_risk_families=("onc", "orcasound"))
     candidates, rejected, summaries = [], [], {}
     seen_sources, seen_hashes = set(), set()
@@ -110,8 +156,13 @@ def build_plan(config, catalog_dir, *, protected_manifest=None):
         if path.is_file():
             for row in read_jsonl(path):
                 row = {**row, "source_key": source, "target_hours": spec["target_hours"]}
+                if row.get("source_family") == "orcasound":
+                    row = legacy_calendar_identity(row)
                 provenance = _provenance(row)
                 reasons = set(index.reasons(provenance))
+                if (row.get("time_basis") == "unspecified_local_clock"
+                        and not legacy_year_is_separated(row.get("legacy_calendar_year"), selected_test_years)):
+                    reasons.update({"unresolved_pretrain_provenance", "legacy_year_not_separated_from_selected_tests"})
                 original = str(row.get("path_in_source") or "")
                 if row.get("source_family") != spec["source_family"]:
                     reasons.add("unexpected_source_family")
@@ -121,7 +172,7 @@ def build_plan(config, catalog_dir, *, protected_manifest=None):
                     reasons.add("upstream_test_split")
                 if any(prefix.lower() in original.lower() for prefix in spec.get("excluded_prefixes", [])):
                     reasons.add("reserved_source_prefix")
-                identity = (spec["source_family"], row.get("source_id"))
+                identity = (spec["source_family"], row.get("source_recording_id") or row.get("source_id"))
                 sha = row.get("sha256")
                 if identity in seen_sources or (sha and sha in seen_hashes):
                     reasons.add("duplicate_source_or_hash")

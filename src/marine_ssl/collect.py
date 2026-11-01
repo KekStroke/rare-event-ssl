@@ -10,12 +10,15 @@ import shutil
 import threading
 
 from .io import client, read_jsonl, write_json, write_jsonl
-from .planning import build_plan, object_catalog
+from .planning import build_plan, object_catalog, legacy_calendar_identity
 from .prepare import prepare
 
 
 def _normalize_orcasound(row):
     """Use explicit filename/prefix dates; ambiguous originals stay unresolved."""
+    legacy = legacy_calendar_identity(row)
+    if legacy.get("time_basis") == "unspecified_local_clock":
+        return legacy
     if row.get("recording_start_utc"):
         return row
     row = {key: value for key, value in row.items() if key != "session_id"}
