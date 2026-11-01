@@ -257,3 +257,29 @@ class ParallelPrepareTests(unittest.TestCase):
                     m.prepare(config, [{**row, "source_etag": '"version-b"'}], output, workers=2, download_workers=4)
             self.assertEqual(receipt.read_bytes(), original_receipt)
             self.assertEqual(m.digest(shard), original_tar_hash)
+
+    def test_same_basename_different_station_keeps_first_artifact_origin_for_resume(self):
+        nb = {**self.row("a", "shared-basename", "A"), "source_recording_id": "legacy:nb:20110325T230326",
+              "path_in_source": "wholistener/nb/shared-basename.mp3", "url": "https://public/nb/shared.mp3",
+              "source_etag": '"nb-version"'}
+        os = {**nb, "source_recording_id": "legacy:os:20110325T230326",
+              "path_in_source": "wholistener/os/shared-basename.mp3", "url": "https://public/os/shared.mp3",
+              "source_etag": '"os-version"'}
+        config = self.config({"a": 5})
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            self.run_prepare(config, [nb], output)
+            receipt = next((output / "receipts" / "a").glob("*.json"))
+            original = receipt.read_bytes()
+            with patch.object(m, "_source", side_effect=AssertionError("must not download either object")), \
+                    patch.object(m, "_convert", side_effect=AssertionError("must not recreate receipt")), \
+                    patch.object(m.shutil, "which", return_value="mock-tool"):
+                result = m.prepare(config, [nb, os], output, workers=2, download_workers=4)
+            self.assertTrue(result["sources"]["a"]["quota_met"])
+            self.assertEqual(result["counts"]["reused_recordings"], 1)
+            self.assertEqual(result["counts"]["excluded_source_id_collisions"], 1)
+            self.assertEqual(receipt.read_bytes(), original)
+            issues = [json.loads(line) for line in (output / "preparation_issues.jsonl").read_text().splitlines()]
+            self.assertEqual(issues[0]["path_in_source"], os["path_in_source"])
+            self.assertEqual(issues[0]["retained_path_in_source"], nb["path_in_source"])
+        self.assertEqual(m._source_differences(nb, os), ["url", "source_etag"])

@@ -43,12 +43,18 @@ def _signature(config):
     return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
-def _same_source(saved, row):
+def _source_differences(saved, row):
+    fields = ("source_id", "url", "revision", "sha256", "source_generation", "generation", "local_path")
+    differences = [key for key in fields if saved.get(key) != row.get(key)]
     def etag(origin):
         return str(origin.get("source_etag") or origin.get("etag") or "").strip().strip('"')
-    return (etag(saved) == etag(row)
-            and all(saved.get(key) == row.get(key) for key in
-                    ("source_id", "url", "revision", "sha256", "source_generation", "generation", "local_path")))
+    if etag(saved) != etag(row):
+        differences.append("source_etag")
+    return differences
+
+
+def _same_source(saved, row):
+    return not _source_differences(saved, row)
 
 
 def _error_message(exc):
@@ -303,6 +309,7 @@ def prepare(config, candidates, output, *, workers=8, download_workers=None):
     if any(not re.fullmatch(r"[a-z0-9_-]+", source) for source in targets):
         raise ValueError("Unsafe source key")
     rows_by_key, queues, identities = {}, {source: deque() for source in targets}, set()
+    excluded_collisions = []
     for row in candidates:
         source = row["source_key"]
         if source not in queues:
@@ -316,11 +323,22 @@ def prepare(config, candidates, output, *, workers=8, download_workers=None):
             spec = config["sources"][source]
             row = {**row, "use_range_prefix": bool(spec.get("use_range_prefix", False)),
                    "per_record_max_seconds": spec.get("per_record_max_seconds", config.get("per_record_max_seconds", 3600))}
-        identities.add(identity); rows_by_key[(source, _key(row))] = row; queues[source].append(row)
+        artifact_key = (source, _key(row))
+        if artifact_key in rows_by_key:
+            retained = rows_by_key[artifact_key]
+            excluded_collisions.append({"status": "excluded_source_id_collision", "source_key": source,
+                                        **_origin_metadata(row),
+                                        "retained_path_in_source": retained.get("path_in_source"),
+                                        "retained_source_recording_id": retained.get("source_recording_id"),
+                                        "excluded_source_recording_id": row.get("source_recording_id")})
+            continue
+        identities.add(identity); rows_by_key[artifact_key] = row; queues[source].append(row)
     lockfile = output / ".prepare.lock"
     with lockfile.open("x", encoding="utf-8") as stream:
         stream.write(json.dumps({"pid": os.getpid(), "started_utc": datetime.now(timezone.utc).isoformat()}))
-    progress, totals, manifest, issues = Counter(), Counter(), [], []
+    progress, totals, manifest, issues = Counter(), Counter(), [], list(excluded_collisions)
+    if excluded_collisions:
+        progress["excluded_source_id_collisions"] = len(excluded_collisions)
     seen_segments, seen_pcm, seen_raw = set(), set(), set()
     stop, last_checkpoint = threading.Event(), 0.0
     reserve = int(config.get("reserve_bytes", 400_000_000_000))
@@ -386,8 +404,14 @@ def prepare(config, candidates, output, *, workers=8, download_workers=None):
         row, receipt = item
         shard, expected = paths(row)
         result = json.loads(receipt.read_text(encoding="utf-8"))
-        if receipt != expected or result.get("configuration_sha256") != signature or not _same_source(result["source"], row):
-            raise ValueError("Existing prepared receipt is incompatible; preserve and inspect")
+        differences = _source_differences(result["source"], row)
+        if receipt != expected:
+            differences.append("receipt_path")
+        if result.get("configuration_sha256") != signature:
+            differences.append("configuration_sha256")
+        if differences:
+            raise ValueError(f"Existing prepared receipt is incompatible; source_id={row['source_id']!r}; "
+                             f"receipt={receipt}; diff_fields={','.join(differences)}; preserve and inspect")
         if not shard.is_file() or digest(shard) != result.get("tar_sha256"):
             raise ValueError("Existing prepared TAR is missing or corrupt; preserve and inspect")
         if (len(result["segments"]) != result["segment_count"]
