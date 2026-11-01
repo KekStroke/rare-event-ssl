@@ -283,3 +283,24 @@ class ParallelPrepareTests(unittest.TestCase):
             self.assertEqual(issues[0]["path_in_source"], os["path_in_source"])
             self.assertEqual(issues[0]["retained_path_in_source"], nb["path_in_source"])
         self.assertEqual(m._source_differences(nb, os), ["url", "source_etag"])
+
+    def test_isolated_bad_file_cluster_does_not_starve_later_valid_input(self):
+        config = self.config({"a": 5})
+        bad = [self.row("a", f"bad-{number}", "A") for number in range(12)]
+        good = self.row("a", "valid-after-cluster", "B")
+        def convert(row, *args):
+            if row["source_id"].startswith("bad-"):
+                raise ValueError("known corrupt MP3 frame")
+            return self.convert(row, *args)
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self.run_prepare(config, bad + [good], Path(temporary), convert)
+        self.assertEqual(result["counts"]["errors"], 12)
+        self.assertEqual(result["counts"]["prepared_recordings"], 1)
+        self.assertEqual(result["sources"]["a"]["actual_frames"], 80000)
+        self.assertTrue(result["sources"]["a"]["quota_met"])
+        with tempfile.TemporaryDirectory() as temporary:
+            all_bad = self.run_prepare(config, bad, Path(temporary), convert)
+        self.assertEqual(all_bad["counts"]["errors"], 12)
+        self.assertEqual(all_bad["sources"]["a"]["actual_frames"], 0)
+        self.assertFalse(all_bad["sources"]["a"]["quota_met"])
+        self.assertEqual(all_bad["status"], "incomplete")

@@ -550,7 +550,9 @@ def prepare(config, candidates, output, *, workers=8, download_workers=None):
                             issues.append(issue); print(json.dumps({"stage": "prepare_error", **issue}), flush=True)
                             checkpoint("error", force=True)
                             if issue["isolated_decode_error"]: clean_raw(task)
-                            if not issue["isolated_decode_error"] or consecutive_errors >= 10: abort = True
+                            # A finite queue may contain a cluster of bad files; only
+                            # infrastructure/transfer failures stop other valid data.
+                            if not issue["isolated_decode_error"]: abort = True
                         elif not outcome.get("skipped_after_quota"):
                             try:
                                 commit(task, outcome); consecutive_errors = 0
