@@ -69,23 +69,49 @@ def gcs_catalog(bucket, prefix, *, session=None):
     return result
 
 
-def s3_catalog(bucket, prefix, *, session=None):
+def s3_catalog(bucket, prefix, *, session=None, max_objects=10000):
+    """List a bounded prefix; logs distinguish a capped catalog from full inventory."""
+    import json
     import xml.etree.ElementTree as ET
+    from requests import Session
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    if not isinstance(max_objects, int) or max_objects < 1:
+        raise ValueError("max_objects must be a positive integer")
     session = session or client()
-    params = {"list-type": "2", "prefix": prefix, "max-keys": 1000}
-    result = []
+    if isinstance(session, Session):
+        session.mount("https://", HTTPAdapter(max_retries=Retry(
+            total=2, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"], respect_retry_after_header=True)))
+    params = {"list-type": "2", "prefix": prefix, "max-keys": min(1000, max_objects)}
+    result, capped = [], False
     ns = {"s": "http://s3.amazonaws.com/doc/2006-03-01/"}
+    print(json.dumps({"stage": "s3_catalog_start", "bucket": bucket, "prefix": prefix,
+                      "max_objects": max_objects}), flush=True)
     while True:
-        response = session.get(f"https://{bucket}.s3.amazonaws.com/", params=params, timeout=120)
+        params["max-keys"] = min(1000, max_objects - len(result))
+        response = session.get(f"https://{bucket}.s3.amazonaws.com/", params=params, timeout=60)
         response.raise_for_status()
         page = ET.fromstring(response.content)
-        for item in page.findall("s:Contents", ns):
+        objects = page.findall("s:Contents", ns)
+        remaining = max_objects - len(result)
+        for item in objects[:remaining]:
             result.append({"name": item.findtext("s:Key", namespaces=ns),
                            "size": int(item.findtext("s:Size", namespaces=ns)),
                            "etag": item.findtext("s:ETag", namespaces=ns)})
-        if page.findtext("s:IsTruncated", namespaces=ns) != "true":
+        truncated = page.findtext("s:IsTruncated", namespaces=ns) == "true"
+        if len(result) >= max_objects:
+            capped = truncated or len(objects) > remaining
             break
-        params["continuation-token"] = page.findtext("s:NextContinuationToken", namespaces=ns)
+        if not truncated:
+            break
+        token = page.findtext("s:NextContinuationToken", namespaces=ns)
+        if not token or token == params.get("continuation-token"):
+            raise ValueError("Invalid or repeated S3 continuation token")
+        params["continuation-token"] = token
+    print(json.dumps({"stage": "s3_catalog_done", "bucket": bucket, "prefix": prefix,
+                      "objects": len(result), "catalog_inventory_complete": not capped,
+                      "cap_reached": capped}), flush=True)
     return result
 
 

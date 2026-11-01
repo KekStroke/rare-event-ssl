@@ -22,7 +22,10 @@ def object_catalog(spec, *, session=None):
     fetch = gcs_catalog if kind == "gcs" else s3_catalog
     seen = set()
     for prefix in spec.get("prefixes", [""]):
-        for item in fetch(bucket, prefix, session=session):
+        options = {"session": session}
+        if kind == "s3" and "max_objects_per_prefix" in spec:
+            options["max_objects"] = spec["max_objects_per_prefix"]
+        for item in fetch(bucket, prefix, **options):
             name = item["name"]
             if name in seen or Path(name).suffix.lower() not in AUDIO_SUFFIXES:
                 continue

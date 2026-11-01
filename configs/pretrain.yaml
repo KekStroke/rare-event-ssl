@@ -38,6 +38,8 @@ sources:
     # Additional cached acoustic-sandbox rows may augment this catalog after
     # resolving original source identities. DORI is not a second audio source.
     bucket: acoustic-sandbox
+    # Bounded metadata sample per prefix; actual duration still controls quotas.
+    max_objects_per_prefix: 10000
     prefixes:
       - 2017-09-05-SRKW/
       - 2017-09-27_OS_SRKW-wav/
