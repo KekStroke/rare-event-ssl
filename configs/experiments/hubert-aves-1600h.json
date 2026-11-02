@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "code_revision": "record exact immutable source SHA-256 in each MLS job",
+  "seed": 20261103,
+  "shared_root": "/mnt/shared_ru.ml.SZ-2_000180/Iskhakov",
+  "inventory_index": "/home/jovyan/iskhakov_anvar_local/jobs/marine_ssl_model_inventory_20261102/artifacts/index.json",
+  "report_root": "/mnt/shared_ru.ml.SZ-2_000180/Iskhakov/reports/rare-event-ssl/hubert-aves-1600h-20261103",
+  "cache_root": "/mnt/shared_ru.ml.SZ-2_000180/Iskhakov/reports/rare-event-ssl/hubert-aves-1600h-20261103/features",
+  "cache_budget_bytes_per_model": 137438953472,
+  "models": ["aves_published", "hubert_published"],
+  "datasets": {
+    "avacha_calls": {"seed": 42, "allow_missing_validation_classes": true},
+    "avacha_presence": {"seed": 42},
+    "watkins": {"seed": 42, "duplicate_policy": "holdout_priority"},
+    "hiceas": {},
+    "hackathon": {},
+    "avacha_field": {},
+    "dominica": {"seed": 42, "allow_new_group_split": true},
+    "manual": {"allow_rounded_uem_view": true, "allow_partial_provenance": true},
+    "onc": {"requires_head_from": "avacha_presence"},
+    "voices": {"requires_head_from": "watkins"}
+  },
+  "head": {
+    "seed": 42,
+    "layers": [6, 9, 12],
+    "C": [0.1, 1.0, 10.0],
+    "max_iter": 1000,
+    "class_weight": "balanced",
+    "context_seconds": 5.0,
+    "pooling": "mean_std",
+    "onc_aggregation": "max_chunk_probability",
+    "bootstrap_resamples": 2000,
+    "temporal": {
+      "layers": [6, 9, 12],
+      "max_train_frames": 50000,
+      "C": 1.0,
+      "selection_iou": 0.5,
+      "report_ious": [0.5, 0.8],
+      "selection_tolerance_seconds": 0.01,
+      "point_tolerances_seconds": [0.001, 0.005, 0.01],
+      "field_far_budgets": [50, 100, 300]
+    }
+  },
+  "excluded_current_tasks": {
+    "dclde2027": "metadata only; audio subset not selected",
+    "orcasound_cross_deployment_holdout": "no fixed labeled test split"
+  },
+  "historical_reference": {
+    "checkpoint": "aves_hubert_16khz_scratch__checkpoint_7_115000__composite_0.9284.pt",
+    "selection_bias": "historical downstream test influenced model/layer selection; reference only",
+    "status": "strict Fairseq backbone conversion required; no partial-load fallback"
+  }
+}

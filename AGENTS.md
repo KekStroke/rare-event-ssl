@@ -19,3 +19,10 @@ New data tooling lives in `src/marine_ssl`, with configuration in `configs`.
 
 Validate changes with `python -m unittest discover -s tests -v`. FFmpeg and
 ffprobe are required for preparation; tests do not need network access.
+
+HuBERT/AVES experiments live in `src/marine_ssl/experiments`; their current
+protocol is `docs/hubert-aves-experiments.md`. Keep historical test-selected
+checkpoints explicitly exploratory. New DAPT starts separately from the two
+published encoders and uses train-only codebook fitting and held-out SSL
+validation. Never interpret unlabeled Orcasound pretraining audio as a labeled
+downstream benchmark or use ONC/Voices external tests to fit/select a head.
