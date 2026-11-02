@@ -70,6 +70,19 @@ class ActualManifestAuditTests(unittest.TestCase):
                 if expected == "partial":
                     self.assertIn("legacy_year_not_separated_from_selected_tests", result["overlap_reason_counts"])
 
+    def test_unknown_benchmark_family_keeps_original_sha_in_global_index(self):
+        prepared = self.prepared({"source_family": "onc", "source_id": "known-original",
+                                  "session_id": "sensor:20240101"})
+        benchmark = self.write("unknown-manual.jsonl", [{"dataset": "manual_sound_noise",
+                    "source_family": "", "source_id": "different-transport-name.wav",
+                    "role": "audio", "full_decode_verified": True, "sha256": "a" * 64}])
+        result = audit_manifests(prepared, [benchmark], self.root)
+        self.assertEqual("partial", result["status"])
+        self.assertFalse(result["metadata_clear"])
+        self.assertEqual(1, result["verified_benchmark_audio_checked"])
+        self.assertEqual(1, result["overlap_reason_counts"]["identical_sha256"])
+        self.assertEqual(1, result["problem_counts"]["benchmark_source_family_unresolved"])
+
 
 if __name__ == "__main__":
     unittest.main()

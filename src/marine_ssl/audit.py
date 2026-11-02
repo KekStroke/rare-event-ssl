@@ -47,6 +47,8 @@ def audit_manifests(prepared_manifest, benchmark_manifests, catalog_dir):
     """Return bounded evidence; metadata clearance is not an acoustic proof."""
     benchmark_manifests = list(benchmark_manifests)
     missing, problems, protected, prepared = [], [], [], []
+    verified_benchmark_hashes = set()
+    verified_benchmark_count = 0
     catalogs = {}
     catalog_dir = Path(catalog_dir)
 
@@ -95,6 +97,15 @@ def audit_manifests(prepared_manifest, benchmark_manifests, catalog_dir):
                 problems.append("benchmark_audio_not_decode_verified")
                 continue
             row = enrich(row)
+            verified_benchmark_count += 1
+            # Raw-file hashes do not require known lineage. Keep this index
+            # independent of the source/session index, which requires a family.
+            sha = str(row.get("sha256") or "").lower()
+            if sha:
+                if re.fullmatch(r"[0-9a-f]{64}", sha):
+                    verified_benchmark_hashes.add(sha)
+                else:
+                    problems.append("benchmark_source_sha256_invalid")
             if not row.get("source_family"):
                 problems.append("benchmark_source_family_unresolved")
             else:
@@ -125,6 +136,8 @@ def audit_manifests(prepared_manifest, benchmark_manifests, catalog_dir):
     counts, examples = Counter(), []
     for row in prepared:
         reasons = set(index.reasons(row))
+        if str(row.get("sha256") or "").lower() in verified_benchmark_hashes:
+            reasons.add("identical_sha256")
         if (row.get("source_family") == "orcasound"
                 and row.get("time_basis") == "unspecified_local_clock"
                 and not legacy_year_is_separated(row.get("legacy_calendar_year"), selected_test_years)):
@@ -140,7 +153,7 @@ def audit_manifests(prepared_manifest, benchmark_manifests, catalog_dir):
     incomplete = bool(missing or problems or unresolved or uncertain or not protected or not prepared)
     return {"status": "partial" if incomplete else "overlap" if counts else "metadata_clear",
             "metadata_clear": not incomplete and not counts,
-            "prepared_recordings_checked": len(prepared), "verified_benchmark_audio_checked": len(protected),
+            "prepared_recordings_checked": len(prepared), "verified_benchmark_audio_checked": verified_benchmark_count,
             "benchmark_manifests": [str(path) for path in benchmark_manifests],
             "missing_manifests": missing, "problem_counts": dict(Counter(problems)),
             "unresolved_shared_families": unresolved, "overlap_reason_counts": dict(counts),

@@ -115,3 +115,5 @@ checksums, exclusions, and validation summaries beside the resulting manifests;
 report upstream missing/empty benchmark audio separately from leakage clearance.
 
 For dated Pacific Sound PCM WAVs, `use_range_prefix: true` acquires only the configured first six hours using verified HTTP ranges and a pinned ETag. The original object identity stays in provenance; the materialized prefix has its own SHA-256 and is never reported as the full original hash. Unsupported containers fall back to full-object acquisition.
+
+Verified benchmark audio participates in original-file SHA-256 screening even when its source family is unknown. Missing origin evidence keeps the audit partial; an assignment based only on the local dataset directory or filename is not verified source provenance.
