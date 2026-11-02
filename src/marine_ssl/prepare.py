@@ -487,9 +487,12 @@ def prepare(config, candidates, output, *, workers=8, download_workers=None):
                         existing.append((row, receipt))
         reused_keys = set()
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            for row, result, shard, receipt in pool.map(verify_existing, existing):
-                add_committed(row, result, shard, receipt, reused=True)
-                reused_keys.add((row["source_key"], _key(row)))
+            verification_window = max(1, workers * 2)
+            for offset in range(0, len(existing), verification_window):
+                batch = existing[offset:offset + verification_window]
+                for row, result, shard, receipt in pool.map(verify_existing, batch):
+                    add_committed(row, result, shard, receipt, reused=True)
+                    reused_keys.add((row["source_key"], _key(row)))
         for source in queues:
             queues[source] = deque(row for row in queues[source] if (source, _key(row)) not in reused_keys)
         largest = sorted((int(row.get("bytes", row.get("size")) or 0) for rows in queues.values() for row in rows), reverse=True)[:download_workers + workers]
