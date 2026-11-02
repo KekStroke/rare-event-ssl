@@ -73,7 +73,8 @@ def main():
     summary = {"stage": args.stage, "config_sha256": config_sha, "versions": versions,
                "started_utc": datetime.now(timezone.utc).isoformat(), "models": {},
                "code_revision": config["code_revision"], "status": "running"}
-    report = run_root / (args.stage + "_status.json")
+    # Independent model jobs share cohorts/caches, but never a status writer.
+    report = run_root / (args.stage + "_status_" + stable_hash(selected)[:12] + ".json")
     for name in selected:
         spec = models[name]
         encoder = load_encoder(spec, device="cuda:0") if args.stage == "features" else None

@@ -75,3 +75,13 @@ The optional `experiments` dependency set records the verified image API. Use
 the MLS image's Torch installation; installing a training stack on Jupyter is
 outside this workflow. Each submitted job freezes and hashes its small source
 snapshot. Later repository edits do not mutate a queued/running job's source.
+
+Retained historical Fairseq files must be read in an isolated CPU job with
+genuine Fairseq Dictionary/configuration classes. The verified conversion used
+official Fairseq commit `4a388e64cd646ed7d7ad8de8fae55df2b8eea91d`, OmegaConf
+2.0.6 and Hydra 1.0.7. Record every backbone mapping and explicit training-head
+exclusion. PyTorch's documented positional weight-norm g/v aliases may migrate
+to `parametrizations.weight.original0/original1` without changing tensors;
+require full key/shape coverage and an exact encoder-output roundtrip. Never
+replace missing classes with pickle stubs or accept a partially initialized
+encoder. The converted historical encoder remains subject to its selection bias.
