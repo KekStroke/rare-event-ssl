@@ -340,7 +340,8 @@ def prepare(config, candidates, output, *, workers=8, download_workers=None):
     if excluded_collisions:
         progress["excluded_source_id_collisions"] = len(excluded_collisions)
     seen_segments, seen_pcm, seen_raw = set(), set(), set()
-    stop, last_checkpoint = threading.Event(), 0.0
+    stop, last_checkpoint = threading.Event(), time.monotonic()
+    manifest_dirty = True
     reserve = int(config.get("reserve_bytes", 400_000_000_000))
     stage = "verify_existing"
 
@@ -352,16 +353,20 @@ def prepare(config, candidates, output, *, workers=8, download_workers=None):
                 "counts": dict(progress), "decode_workers": workers, "download_workers": download_workers,
                 "training_ready": False, "last_issue": issues[-1] if issues else None}
 
-    def checkpoint(status, force=False):
-        nonlocal last_checkpoint
+    def checkpoint(status, force=False, terminal=False):
+        nonlocal last_checkpoint, manifest_dirty
         now = time.monotonic()
-        if not force and now - last_checkpoint < 60:
+        normal_due = now - last_checkpoint >= 60
+        if not force and not terminal and not normal_due:
             return
-        last_checkpoint = now
+        if normal_due:
+            last_checkpoint = now
         write_json(output / "preparation.json", summary(status))
-        if force:
+        if force or terminal:
             write_jsonl(output / "preparation_issues.jsonl", issues)
+        if manifest_dirty and (normal_due or terminal):
             write_jsonl(output / "prepared_manifest.jsonl", manifest)
+            manifest_dirty = False
 
     def heartbeat():
         while not stop.wait(60):
@@ -381,6 +386,7 @@ def prepare(config, candidates, output, *, workers=8, download_workers=None):
         return output / "shards" / source / (key + ".tar"), output / "receipts" / source / (key + ".json")
 
     def add_committed(row, result, shard, receipt, reused=False):
+        nonlocal manifest_dirty
         hashes = {segment["pcm_sha256"] for segment in result["segments"]}
         if hashes & seen_segments or result["normalized_pcm_sha256"] in seen_pcm:
             raise ValueError("Existing prepared artifacts overlap; preserve and inspect")
@@ -396,6 +402,7 @@ def prepare(config, candidates, output, *, workers=8, download_workers=None):
                          "decoder_backend": result.get("decoder_backend", "ffmpeg"),
                          "decoder_versions": result.get("decoder_versions", {"ffmpeg": "legacy-unrecorded"}),
                          "selection_order": result.get("selection_order"), "selected_at_utc": result.get("selected_at_utc")})
+        manifest_dirty = True
         progress["prepared_recordings"] += 1; progress["segments"] += result["segment_count"]
         progress["reused_recordings" if reused else "new_recordings"] += 1
         checkpoint("running")
@@ -551,7 +558,7 @@ def prepare(config, candidates, output, *, workers=8, download_workers=None):
                                      "error": _error_message(exc), "status": "error",
                                      "isolated_decode_error": outcome.get("isolated_decode_error", False)}
                             issues.append(issue); print(json.dumps({"stage": "prepare_error", **issue}), flush=True)
-                            checkpoint("error", force=True)
+                            checkpoint("error", force=True, terminal=not issue["isolated_decode_error"])
                             if issue["isolated_decode_error"]: clean_raw(task)
                             # A finite queue may contain a cluster of bad files; only
                             # infrastructure/transfer failures stop other valid data.
@@ -565,7 +572,7 @@ def prepare(config, candidates, output, *, workers=8, download_workers=None):
                                          "status": "commit_error", "error": _error_message(exc)}
                                 issues.append(issue)
                                 print(json.dumps({"stage": "prepare_error", **issue}), flush=True)
-                                checkpoint("commit_error", force=True)
+                                checkpoint("commit_error", force=True, terminal=True)
                                 abort = True
                         release(task)
                 if abort:
@@ -600,13 +607,13 @@ def prepare(config, candidates, output, *, workers=8, download_workers=None):
                 checkpoint("running")
         result = summary("complete" if all(totals[key] >= targets[key] for key in targets) else "incomplete")
         result["completed_utc"] = datetime.now(timezone.utc).isoformat()
-        checkpoint(result["status"], force=True); write_json(output / "preparation.json", result)
+        checkpoint(result["status"], force=True, terminal=True); write_json(output / "preparation.json", result)
         print(json.dumps(result), flush=True)
         return result
     except BaseException as exc:
         issues.append({"status": "fatal_error", "error": _error_message(exc)})
         print(json.dumps({"stage": "prepare_error", **issues[-1]}), flush=True)
-        checkpoint("fatal_error", force=True)
+        checkpoint("fatal_error", force=True, terminal=True)
         raise
     finally:
         stop.set(); thread.join(timeout=1); lockfile.unlink()

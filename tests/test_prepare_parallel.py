@@ -304,3 +304,36 @@ class ParallelPrepareTests(unittest.TestCase):
         self.assertEqual(all_bad["sources"]["a"]["actual_frames"], 0)
         self.assertFalse(all_bad["sources"]["a"]["quota_met"])
         self.assertEqual(all_bad["status"], "incomplete")
+
+    def test_isolated_errors_persist_without_rewriting_unchanged_manifest(self):
+        config = self.config({"a": 10})
+        prefix = self.row("a", "retained-prefix", "A")
+        bad = [self.row("a", f"bad-{number}", "B") for number in range(12)]
+        good = self.row("a", "new-valid", "C")
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            self.run_prepare(config, [prefix], output)
+            prefix_receipt = next((output / "receipts" / "a").glob("*.json"))
+            original_receipt = prefix_receipt.read_bytes()
+            manifest_writes = []
+            real_write = m.write_jsonl
+            def write(path, rows):
+                if Path(path).name == "prepared_manifest.jsonl":
+                    manifest_writes.append([row["source_id"] for row in rows])
+                return real_write(path, rows)
+            def convert(row, *args):
+                if row["source_id"].startswith("bad-"):
+                    raise ValueError("known isolated corrupt input")
+                self.assertTrue((output / "preparation_issues.jsonl").is_file())
+                self.assertIn("known isolated corrupt input", (output / "preparation_issues.jsonl").read_text())
+                self.assertEqual(manifest_writes, [], "unchanged prefix was rewritten by isolated errors")
+                return self.convert(row, *args)
+            with patch.object(m, "write_jsonl", side_effect=write), \
+                    patch.object(m.time, "monotonic", return_value=1000):
+                result = self.run_prepare(config, [prefix] + bad + [good], output, convert)
+            self.assertEqual(manifest_writes, [["retained-prefix", "new-valid"]])
+            self.assertEqual(prefix_receipt.read_bytes(), original_receipt)
+            self.assertEqual(result["counts"]["errors"], 12)
+            self.assertEqual(result["sources"]["a"]["actual_frames"], 160000)
+            self.assertTrue(result["sources"]["a"]["quota_met"])
+            self.assertEqual(len((output / "prepared_manifest.jsonl").read_text().splitlines()), 2)
