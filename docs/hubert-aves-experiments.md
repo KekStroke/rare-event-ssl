@@ -45,6 +45,15 @@ regression with C in 0.1/1/10. No examples move between upstream splits. Unknown
 manual annotations are never converted to negative labels. Native UEM rounding
 is tolerated only within the declared half-quantum; source files are unchanged.
 
+The temporal probe fixes candidate interval boundaries at frame probability
+0.3; later operating thresholds discard whole candidates. Its validation grid
+is 0.3 through 0.9 plus reject-all, rather than a continuous operating curve.
+The initial three models selected reject-all at the Field false-alarm budgets.
+Their zero budgeted recall describes this head/decoder operating point; retain
+the separately reported ranked event AP. It does not establish absence of useful
+encoder information. Manual validation events have median duration 0.939 s, so
+its low IoU AP cannot be attributed solely to the 20 ms feature stride either.
+
 Feature extraction runs on GPU, supervised head fitting on MLS CPU/payg. A
 single-owner, resumable SQLite cache avoids one feature file per clip. Cache
 identity includes source hashes/intervals, the full registered model identity,

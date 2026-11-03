@@ -74,6 +74,8 @@ def compare_run(report_root, *, reference="hubert_published", n_resamples=2000, 
             continue
         results = {}
         for task in sorted(base.iterdir()):
+            if not task.is_dir():
+                continue
             prediction = task / "test_predictions.json"
             other = candidate / task.name / "test_predictions.json"
             if not prediction.is_file() or not other.is_file():
