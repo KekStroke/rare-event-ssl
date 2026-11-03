@@ -6,6 +6,14 @@ encoders initialized separately from the published models. The historical best
 is an exploratory reference: downstream test results influenced its selection.
 Its original pretraining exposure is not certified by the new corpus audit.
 
+Published AVES-bio declares FSD50K and subsets of AudioSet/VGGSound as its SSL
+sources; Watkins and HICEAS are instead named as BEANS downstream evaluation
+and development tasks. Their use during development of the AVES family must
+remain visible in the comparison. The publications do not provide a recording
+deduplication audit against the web corpora, so they establish neither sample
+overlap nor certified absence of overlap. See the [official model inventory](https://github.com/earthspecies/aves#pretrained-models)
+and [AVES data/evaluation description](https://arxiv.org/html/2210.14493v1#S3).
+
 The primary comparison freezes each encoder and fits the same supervised heads.
 All models share immutable cohorts, preprocessing, head search and matching
 rules. Selection uses validation only. Test predictions never select layers,

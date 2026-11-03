@@ -21,6 +21,26 @@ from .codebook import digest, fingerprint, index_info, read_config, write_json
 from .ssl_data import TarAudioDataset, _json_bytes, _rows, _shuffle, iter_tar_samples
 
 
+def device_telemetry(device):
+    """Process-local memory peaks; CPU reporting does not initialize CUDA."""
+    import torch
+    resolved = torch.device(device)
+    result = {"device": str(resolved), "device_type": resolved.type, "device_name": "CPU",
+              "device_total_memory_bytes": None, "gpu_allocated_bytes": None,
+              "gpu_reserved_bytes": None, "gpu_peak_allocated_bytes": None,
+              "gpu_peak_reserved_bytes": None}
+    if resolved.type == "cuda":
+        index = resolved.index if resolved.index is not None else torch.cuda.current_device()
+        properties = torch.cuda.get_device_properties(index)
+        result.update(device_name=properties.name, device_total_memory_bytes=int(properties.total_memory),
+                      cuda_capability=[int(properties.major), int(properties.minor)],
+                      gpu_allocated_bytes=int(torch.cuda.memory_allocated(index)),
+                      gpu_reserved_bytes=int(torch.cuda.memory_reserved(index)),
+                      gpu_peak_allocated_bytes=int(torch.cuda.max_memory_allocated(index)),
+                      gpu_peak_reserved_bytes=int(torch.cuda.max_memory_reserved(index)))
+    return result
+
+
 def learning_rate(update, total_updates, *, peak=5e-5, warmup_updates=5000):
     """Fairseq polynomial decay, power one, end LR zero; first update is one."""
     if total_updates < 1 or update < 0 or warmup_updates < 0:
@@ -307,6 +327,7 @@ def train(config, *, resume=None, stop_after_updates=None):
                   "objective_reference": "https://github.com/pytorch/audio/blob/v2.2.2/src/torchaudio/models/wav2vec2/components.py",
                   "effective_batch_clips": 140, "retention_keep_last": int(config.get("keep_last", 2))}
     provenance["input_normalize_waveform"] = bool(model.input_normalize_waveform)
+    provenance["device_info"] = device_telemetry(device)
     provenance["optimizer"] = {"name": "torch.optim.AdamW", "weight_decay": "decoupled", "lr": 5e-5,
         "betas": [.9, .98], "eps": 1e-6, "weight_decay_coefficient": .01,
         "historical_bitwise_equivalence": False,
@@ -314,11 +335,37 @@ def train(config, *, resume=None, stop_after_updates=None):
         "reference": "https://github.com/facebookresearch/fairseq/blob/v0.12.2/fairseq/optim/adam.py"}
     write_json(output / "run.json", provenance)
     print(json.dumps({"stage": "train_start", "step": state["global_step"], "total_updates": total_updates,
-                      "microbatch": microbatch, "accumulation": accumulation, "precision": precision}), flush=True)
+                      "microbatch": microbatch, "accumulation": accumulation, "precision": precision,
+                      "device_info": provenance["device_info"]}), flush=True)
     last_log, started, updates_this_call = time.monotonic(), time.monotonic(), 0
+    checkpoint_seconds_total = validation_seconds_total = 0.0
+    checkpoint_events = 0
+    last_checkpoint_seconds = 0.0
+    steady_started = None
+    steady_nontraining_baseline = 0.0
     last_validation = None
+    def training_timing(now):
+        nontraining = checkpoint_seconds_total + validation_seconds_total
+        return {"training_seconds_before_final_checkpoint": max(0.0, now - started - nontraining),
+                "steady_training_seconds": (max(0.0, now - steady_started - nontraining + steady_nontraining_baseline)
+                                             if steady_started is not None else None),
+                "steady_updates": max(0, updates_this_call - 2), "timing_warmup_updates_excluded": 2,
+                "checkpoint_seconds_total": checkpoint_seconds_total, "checkpoint_events": checkpoint_events,
+                "validation_seconds_total": validation_seconds_total,
+                "timing_basis": "wall time includes data reads; checkpoint and validation time excluded"}
+    def synchronize_for_timing():
+        if str(device).startswith("cuda"):
+            torch.cuda.synchronize(device)
+    def run_validation():
+        nonlocal validation_seconds_total
+        before = time.monotonic()
+        try:
+            return validate(model, _loader(config, "validation", 0), device=device, precision=precision, seed=seed + 1)
+        finally:
+            validation_seconds_total += time.monotonic() - before
     def checkpoint(is_best=False):
-        nonlocal history
+        nonlocal history, checkpoint_seconds_total, checkpoint_events, last_checkpoint_seconds
+        before = time.monotonic()
         payload = {**state, "model": model.state_dict(), "optimizer": optimizer.state_dict(),
                    "scaler": scaler.state_dict(), "rng": capture_rng(), "versions": versions}
         history, state["best_checkpoint"] = _save_checkpoint(output, payload, history, is_best=is_best,
@@ -329,6 +376,10 @@ def train(config, *, resume=None, stop_after_updates=None):
                        "step": state["global_step"], "validation": state["best_validation"],
                        "normalize_waveform": bool(model.input_normalize_waveform),
                        "initial_encoder": config["initial_encoder"], "run_signature": signature})
+        last_checkpoint_seconds = time.monotonic() - before
+        checkpoint_seconds_total += last_checkpoint_seconds
+        checkpoint_events += 1
+        return last_checkpoint_seconds
     model.train()
     for epoch in range(state["epoch"], epochs):
         state["epoch"] = epoch
@@ -375,30 +426,44 @@ def train(config, *, resume=None, stop_after_updates=None):
             if now - last_log >= 60 or updates_this_call == 1:
                 progress = {"stage": "train", "epoch": epoch + 1, "step": update, "total_updates": total_updates,
                             "loss": loss_sum / masked_count, "lr": lr, "grad_norm": float(norm),
-                            "updates_per_hour": updates_this_call * 3600 / max(.001, now - started)}
+                            "updates_per_hour": updates_this_call * 3600 / max(.001, now - started),
+                            **training_timing(now),
+                            "device_info": device_telemetry(device)}
                 write_json(output / "progress.json", progress); print(json.dumps(progress), flush=True); last_log = now
             is_best = False
             if update % int(config.get("validation_interval_updates", 1000)) == 0:
-                last_validation = validate(model, _loader(config, "validation", 0), device=device, precision=precision, seed=seed + 1)
+                last_validation = run_validation()
                 is_best = state["best_validation"] is None or last_validation["masked_objective"] < state["best_validation"]["masked_objective"]
                 if is_best:
                     state["best_validation"] = {**last_validation, "step": update}
                 write_json(output / "validation_latest.json", {**last_validation, "step": update})
             if is_best or update % int(config.get("checkpoint_interval_updates", 1000)) == 0:
                 checkpoint(is_best)
+            if updates_this_call == 2:
+                synchronize_for_timing()
+                steady_started = time.monotonic()
+                steady_nontraining_baseline = checkpoint_seconds_total + validation_seconds_total
             if stop_after_updates is not None and updates_this_call >= stop_after_updates:
-                checkpoint()
+                synchronize_for_timing()
+                timing = training_timing(time.monotonic())
+                final_checkpoint_seconds = checkpoint()
                 result = {"status": "pilot_stopped", "step": update, "total_updates": total_updates,
-                          "elapsed_seconds": time.monotonic() - started, "updates_this_call": updates_this_call}
+                          "elapsed_seconds": time.monotonic() - started, "updates_this_call": updates_this_call,
+                          **timing, "final_checkpoint_seconds": final_checkpoint_seconds,
+                          "checkpoint_seconds_total": checkpoint_seconds_total, "checkpoint_events": checkpoint_events,
+                          "device_info": device_telemetry(device)}
                 write_json(output / "summary.json", result); return result
         state["epoch"] = epoch + 1; state["consumed"] = {}
-        last_validation = validate(model, _loader(config, "validation", 0), device=device, precision=precision, seed=seed + 1)
+        last_validation = run_validation()
         is_best = state["best_validation"] is None or last_validation["masked_objective"] < state["best_validation"]["masked_objective"]
         if is_best:
             state["best_validation"] = {**last_validation, "step": state["global_step"]}
         checkpoint(is_best)
     result = {"status": "complete", "step": state["global_step"], "total_updates": total_updates,
-              "epochs": epochs, "best_validation": state["best_validation"], "best_checkpoint": state["best_checkpoint"]}
+              "epochs": epochs, "best_validation": state["best_validation"], "best_checkpoint": state["best_checkpoint"],
+              "elapsed_seconds": time.monotonic() - started, "updates_this_call": updates_this_call,
+              **training_timing(time.monotonic()), "final_checkpoint_seconds": last_checkpoint_seconds,
+              "device_info": device_telemetry(device)}
     write_json(output / "summary.json", result)
     return result
 

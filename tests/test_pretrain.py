@@ -23,6 +23,15 @@ class ScheduleTests(unittest.TestCase):
 
 @unittest.skipUnless(HAS_STACK, "PyTorch/TorchAudio/NumPy required")
 class PretrainStackTests(unittest.TestCase):
+    def test_cpu_telemetry_does_not_query_cuda(self):
+        from marine_ssl.experiments.pretrain import device_telemetry
+        with patch("torch.cuda.get_device_properties", side_effect=AssertionError("CUDA queried")), \
+             patch("torch.cuda.current_device", side_effect=AssertionError("CUDA initialized")):
+            result = device_telemetry("cpu")
+        self.assertEqual(result["device_type"], "cpu")
+        self.assertIsNone(result["gpu_peak_allocated_bytes"])
+        self.assertIsNone(result["gpu_peak_reserved_bytes"])
+
     def test_optimizer_decouples_decay_from_gradient_moments(self):
         import torch
         from marine_ssl.experiments.pretrain import make_optimizer
@@ -135,6 +144,10 @@ class PretrainStackTests(unittest.TestCase):
                 pilot = train({**config, "output_dir": str(root / "resumed")}, stop_after_updates=1)
                 resumed = train({**config, "output_dir": str(root / "resumed")}, resume="auto")
             self.assertEqual(pilot["status"], "pilot_stopped")
+            self.assertGreater(pilot["training_seconds_before_final_checkpoint"], 0)
+            self.assertGreaterEqual(pilot["final_checkpoint_seconds"], 0)
+            self.assertEqual(pilot["steady_updates"], 0)
+            self.assertIsNone(pilot["steady_training_seconds"])
             self.assertEqual(complete["step"], resumed["step"])
             self.assertEqual(optimizer_rates[0][0], 0)
             self.assertEqual(optimizer_rates[0][-1], learning_rate(2, 3, warmup_updates=1))
