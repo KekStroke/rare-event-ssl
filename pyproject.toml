@@ -15,5 +15,19 @@ dependencies = [
   "scipy>=1.10,<2",
 ]
 
+[project.optional-dependencies]
+evaluation = [
+  "scikit-learn==1.5.1",
+  "joblib>=1.4,<2",
+]
+experiments = [
+  "torch==2.2.2",
+  "torchaudio==2.2.2",
+  "transformers==4.44.0",
+  "scikit-learn==1.5.1",
+  "numpy==1.26.4",
+  "joblib>=1.4,<2",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
