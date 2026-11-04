@@ -21,6 +21,36 @@ from .codebook import digest, fingerprint, index_info, read_config, write_json
 from .ssl_data import TarAudioDataset, _json_bytes, _rows, _shuffle, iter_tar_samples
 
 
+AMP_RETRY_POLICY = "amp-fp16-same-batch-retry-v1"
+AMP_COMPATIBLE_PRETRAIN_SHA256 = "74dd527d426f4d65f34179b38ce364e15df7839940733bd45152411257af9ffc"
+
+
+def implementation_sources():
+    root = Path(__file__).parent
+    return {name: digest(root / name) for name in ("pretrain.py", "codebook.py", "encoders.py", "ssl_data.py")}
+
+
+def validate_resume_implementation(config, receipt_path, *, resume, config_path):
+    """Authorize one explicit implementation-only migration, preserving recipe bytes."""
+    if resume is None or config_path is None:
+        raise ValueError("implementation receipt requires explicit resume and original config path")
+    receipt = json.loads(Path(receipt_path).read_text())
+    original, actual = config.get("training_source_sha256"), implementation_sources()
+    if (receipt.get("schema_version") != 1 or receipt.get("policy_id") != AMP_RETRY_POLICY
+            or not isinstance(original, dict) or set(original) != set(actual)
+            or original.get("pretrain.py") != AMP_COMPATIBLE_PRETRAIN_SHA256
+            or receipt.get("original_training_source_sha256") != original
+            or receipt.get("actual_training_source_sha256") != actual
+            or any(actual[name] != original[name] for name in actual if name != "pretrain.py")
+            or receipt.get("config_sha256") != digest(config_path)
+            or receipt.get("recipe_fingerprint") != fingerprint(config)):
+        raise ValueError("unverified resume implementation/config/source migration")
+    latest = json.loads((Path(config["output_dir"]) / "latest.json").read_text())
+    if receipt.get("run_signature") != latest.get("signature"):
+        raise ValueError("implementation receipt identifies a different existing run")
+    return {**receipt, "receipt_sha256": digest(receipt_path)}
+
+
 def device_telemetry(device):
     """Process-local memory peaks; CPU reporting does not initialize CUDA."""
     import torch
@@ -197,6 +227,54 @@ def _autocast(device, precision):
     return torch.autocast("cuda", dtype=torch.float16 if precision == "fp16" else torch.bfloat16)
 
 
+def backward_group(model, optimizer, scaler, batches, *, device, precision, max_retries=8):
+    """Retry AMP overflow on the retained group; commit no optimizer/data step here.
+
+    The RNG snapshot is taken after data fetch. Standard GradScaler skip/update
+    performs backoff and resets its growth tracker; finite-gradient norm overflow
+    and nonfinite objectives remain fatal rather than being silently clipped.
+    """
+    import torch
+    if max_retries < 0:
+        raise ValueError("negative AMP retry budget")
+    prior = capture_rng()
+    denominator = 140 * 249
+    for retry in range(max_retries + 1):
+        if retry:
+            restore_rng(prior)
+        optimizer.zero_grad(set_to_none=True)
+        masked_count, loss_sum = 0, 0.0
+        for batch in batches:
+            with _autocast(device, precision):
+                masked, _, penalty = model(prepare_waveforms(batch["waveform"].to(device, non_blocking=True), model),
+                                            batch["labels"].to(device, non_blocking=True))
+                loss, count = objective_sum(masked, penalty)
+            if not bool(torch.isfinite(loss)):
+                raise FloatingPointError("nonfinite HuBERT objective; prior checkpoint is preserved")
+            scaler.scale(loss / denominator).backward()
+            masked_count += count; loss_sum += float(loss.detach())
+        scaler.unscale_(optimizer)
+        parameters = [parameter for parameter in model.parameters() if parameter.grad is not None]
+        finite = bool(torch.stack([torch.isfinite(parameter.grad).all() for parameter in parameters]).all())
+        if not finite:
+            if precision != "fp16" or not scaler.is_enabled():
+                raise FloatingPointError("nonfinite unscaled gradients without FP16 GradScaler")
+            before = float(scaler.get_scale())
+            # unscale_ already recorded found_inf. This MUST skip AdamW and use
+            # the official scaler backoff/growth-tracker reset, not manual scale.
+            scaler.step(optimizer); scaler.update()
+            after = float(scaler.get_scale())
+            print(json.dumps({"stage": "amp_overflow_retry", "policy": AMP_RETRY_POLICY,
+                              "retry": retry + 1, "scale_before": before, "scale_after": after}), flush=True)
+            if not math.isfinite(after) or not 0 < after < before or retry == max_retries:
+                raise FloatingPointError("FP16 gradient overflow exhausted bounded same-batch retry")
+            continue
+        for parameter in parameters:
+            parameter.grad.mul_(denominator / masked_count)
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0, error_if_nonfinite=True)
+        return masked_count, loss_sum, norm, retry
+
+
 def _loader(config, split, epoch, consumed=None):
     import torch
     dataset = LabeledTarDataset(config[f"{split}_index"], Path(config["labels_dir"]) / "labels.sqlite",
@@ -266,10 +344,16 @@ def _save_checkpoint(output, state, history, *, is_best, keep_last):
     return [item for item in history if item["name"] in retained], best
 
 
-def train(config, *, resume=None, stop_after_updates=None):
+def train(config, *, resume=None, stop_after_updates=None, resume_implementation_receipt=None, config_path=None):
     import numpy as np
     import torch
     import torchaudio
+    implementation = None
+    if resume_implementation_receipt is not None:
+        implementation = validate_resume_implementation(config, resume_implementation_receipt,
+                                                        resume=resume, config_path=config_path)
+    elif config.get("training_source_sha256") and config["training_source_sha256"] != implementation_sources():
+        raise ValueError("training implementation differs; explicit verified resume implementation receipt required")
     if int(config.get("workers", 0)) != 0:
         raise ValueError("exact committed-member resume currently requires workers=0")
     device, precision = config.get("device", "cuda"), config.get("precision", "fp16")
@@ -297,6 +381,8 @@ def train(config, *, resume=None, stop_after_updates=None):
                              "train": train_info, "validation": val_info, "labels": labels["signature"],
                              "optimizer": "torch.optim.AdamW-decoupled-v1",
                              "objective": "torchaudio-hubert-cosine-nce-k200-d256-temp0.1-masked1-feature10-v1"})
+    if implementation is not None and implementation["run_signature"] != signature:
+        raise ValueError("implementation receipt does not preserve recipe/data/schedule signature")
     output = Path(config["output_dir"]); output.mkdir(parents=True, exist_ok=True)
     if (output / "latest.json").exists() and resume is None:
         raise ValueError("existing run requires explicit --resume auto or checkpoint path")
@@ -327,6 +413,8 @@ def train(config, *, resume=None, stop_after_updates=None):
                   "objective_reference": "https://github.com/pytorch/audio/blob/v2.2.2/src/torchaudio/models/wav2vec2/components.py",
                   "effective_batch_clips": 140, "retention_keep_last": int(config.get("keep_last", 2))}
     provenance["input_normalize_waveform"] = bool(model.input_normalize_waveform)
+    provenance["implementation"] = {"actual_training_source_sha256": implementation_sources(),
+                                    "resume_receipt": implementation, "amp_retry_policy": AMP_RETRY_POLICY}
     provenance["device_info"] = device_telemetry(device)
     provenance["optimizer"] = {"name": "torch.optim.AdamW", "weight_decay": "decoupled", "lr": 5e-5,
         "betas": [.9, .98], "eps": 1e-6, "weight_decay_coefficient": .01,
@@ -393,28 +481,13 @@ def train(config, *, resume=None, stop_after_updates=None):
                 batches.append(batch)
             if not batches:
                 break
-            optimizer.zero_grad(set_to_none=True)
-            masked_count, loss_sum = 0, 0.0
-            # Normalize only once across the entire accumulation group, as in
-            # Fairseq's summed-loss / aggregate-sample-size normalization.
-            denominator = 140 * 249
-            for batch in batches:
-                with _autocast(device, precision):
-                    masked, _, penalty = model(prepare_waveforms(batch["waveform"].to(device, non_blocking=True), model), batch["labels"].to(device, non_blocking=True))
-                    loss, count = objective_sum(masked, penalty)
-                if not bool(torch.isfinite(loss)):
-                    raise FloatingPointError("nonfinite HuBERT objective; prior checkpoint is preserved")
-                scaler.scale(loss / denominator).backward()
-                masked_count += count; loss_sum += float(loss.detach())
-            scaler.unscale_(optimizer)
-            for parameter in model.parameters():
-                if parameter.grad is not None:
-                    parameter.grad.mul_(denominator / masked_count)
-            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0, error_if_nonfinite=True)
+            masked_count, loss_sum, norm, retries = backward_group(
+                model, optimizer, scaler, batches, device=device, precision=precision)
             lr = learning_rate(state["global_step"], total_updates, warmup_updates=int(config.get("warmup_updates", 5000)))
             for group in optimizer.param_groups:
                 group["lr"] = lr
             scaler.step(optimizer); scaler.update()
+            state["amp_overflow_retries"] = state.get("amp_overflow_retries", 0) + retries
             update = state["global_step"] + 1
             state["global_step"] = update; updates_this_call += 1
             for batch in batches:
@@ -426,6 +499,7 @@ def train(config, *, resume=None, stop_after_updates=None):
             if now - last_log >= 60 or updates_this_call == 1:
                 progress = {"stage": "train", "epoch": epoch + 1, "step": update, "total_updates": total_updates,
                             "loss": loss_sum / masked_count, "lr": lr, "grad_norm": float(norm),
+                             "amp_overflow_retries": state["amp_overflow_retries"], "loss_scale": float(scaler.get_scale()),
                             "updates_per_hour": updates_this_call * 3600 / max(.001, now - started),
                             **training_timing(now),
                             "device_info": device_telemetry(device)}
@@ -495,23 +569,74 @@ def smoke(output_dir, *, device="cpu"):
     write_json(output / "smoke.json", result); return result
 
 
+def amp_smoke(output_dir, *, device="cuda"):
+    """Tiny actual-CUDA GradScaler overflow/replay proof before a long resume."""
+    import torch
+    if torch.device(device).type != "cuda" or not torch.cuda.is_available():
+        raise ValueError("AMP overflow smoke requires CUDA")
+    seed_everything(20261103)
+
+    class Probe(torch.nn.Module):
+        def __init__(self):
+            super().__init__(); self.linear = torch.nn.Linear(4, 2); self.draws = []
+        def forward(self, waveform, labels):
+            draw = torch.rand((), device=waveform.device); self.draws.append(float(draw))
+            logits = self.linear(waveform + draw)
+            return logits, None, self.linear.weight.float().square().mean() * .01
+
+    model = Probe().to(device).train()
+    injected = []
+    def inject_once(gradient):
+        if not injected:
+            injected.append(True)
+            return torch.full_like(gradient, float("inf"))
+        return gradient
+    handle = model.linear.weight.register_hook(inject_once)
+    optimizer = make_optimizer(model.parameters())
+    commits = []
+    original_step = optimizer.step
+    def step(*args, **kwargs):
+        commits.append(True)
+        return original_step(*args, **kwargs)
+    optimizer.step = step
+    scaler = torch.cuda.amp.GradScaler(enabled=True)
+    before = float(scaler.get_scale())
+    batch = {"waveform": torch.ones(2, 4, device=device),
+             "labels": torch.zeros(2, 1, dtype=torch.long, device=device)}
+    _, _, _, retries = backward_group(model, optimizer, scaler, [batch], device=device, precision="fp16")
+    if (retries != 1 or commits or len(model.draws) != 2 or model.draws[0] != model.draws[1]
+            or scaler.get_scale() != before / 2 or scaler.state_dict()["_growth_tracker"] != 0):
+        raise ValueError("actual CUDA AMP skip/backoff/RNG replay proof failed")
+    scaler.step(optimizer); scaler.update(); handle.remove()
+    if len(commits) != 1 or not all(bool(torch.isfinite(p).all()) for p in model.parameters()):
+        raise ValueError("actual CUDA AMP retry did not produce one finite optimizer commit")
+    result = {"status": "amp_overflow_smoke_passed", "policy": AMP_RETRY_POLICY,
+              "retries": retries, "optimizer_commits": len(commits), "same_rng_replayed": True,
+              "scale_before": before, "scale_after": float(scaler.get_scale()),
+              "implementation_sha256": digest(__file__), "device_info": device_telemetry(device)}
+    write_json(Path(output_dir) / "amp_smoke.json", result)
+    return result
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=("train", "smoke"))
+    parser.add_argument("stage", choices=("train", "smoke", "amp-smoke"))
     parser.add_argument("--config")
     parser.add_argument("--output")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--resume")
+    parser.add_argument("--resume-implementation-receipt")
     parser.add_argument("--stop-after-updates", type=int)
     args = parser.parse_args(argv)
-    if args.stage == "smoke":
+    if args.stage in {"smoke", "amp-smoke"}:
         if not args.output:
             parser.error("smoke requires --output")
-        result = smoke(args.output, device=args.device)
+        result = (amp_smoke if args.stage == "amp-smoke" else smoke)(args.output, device=args.device)
     else:
         if not args.config:
             parser.error("train requires --config")
-        result = train(read_config(args.config), resume=args.resume, stop_after_updates=args.stop_after_updates)
+        result = train(read_config(args.config), resume=args.resume, stop_after_updates=args.stop_after_updates,
+                       resume_implementation_receipt=args.resume_implementation_receipt, config_path=args.config)
     print(json.dumps(result, sort_keys=True), flush=True)
 
 

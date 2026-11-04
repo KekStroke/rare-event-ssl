@@ -26,3 +26,9 @@ checkpoints explicitly exploratory. New DAPT starts separately from the two
 published encoders and uses train-only codebook fitting and held-out SSL
 validation. Never interpret unlabeled Orcasound pretraining audio as a labeled
 downstream benchmark or use ONC/Voices external tests to fit/select a head.
+
+For FP16 overflow, use bounded GradScaler backoff and retry the same fetched
+accumulation group with restored RNG. Commit optimizer steps and data cursors
+only after a successful update. An implementation-only continuation retains
+the original config/signature and records actual patched source in an explicit
+verified resume receipt.

@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from contextlib import nullcontext
 
 from marine_ssl.experiments.pretrain import learning_rate
 
@@ -20,9 +21,111 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(learning_rate(10000, 10000), 0)
         self.assertEqual(learning_rate(20000, 10000), 0)
 
+    def test_explicit_resume_receipt_pins_original_config_and_actual_sources(self):
+        from marine_ssl.experiments.pretrain import (AMP_COMPATIBLE_PRETRAIN_SHA256, AMP_RETRY_POLICY,
+            implementation_sources, validate_resume_implementation)
+        from marine_ssl.experiments.codebook import digest, fingerprint
+        actual = implementation_sources()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            original = {**actual, "pretrain.py": AMP_COMPATIBLE_PRETRAIN_SHA256}
+            config = {"output_dir": str(root), "training_source_sha256": original, "epochs": 10}
+            config_path = root / "original.json"; config_path.write_text(json.dumps(config))
+            (root / "latest.json").write_text(json.dumps({"signature": "original-run"}))
+            receipt = {"schema_version": 1, "policy_id": AMP_RETRY_POLICY,
+                       "config_sha256": digest(config_path), "recipe_fingerprint": fingerprint(config),
+                       "run_signature": "original-run", "original_training_source_sha256": original,
+                       "actual_training_source_sha256": actual}
+            path = root / "implementation.json"; path.write_text(json.dumps(receipt))
+            self.assertEqual(validate_resume_implementation(config, path, resume="auto", config_path=config_path)
+                             ["actual_training_source_sha256"], actual)
+            with self.assertRaisesRegex(ValueError, "explicit resume"):
+                validate_resume_implementation(config, path, resume=None, config_path=config_path)
+            for changed in ({"actual_training_source_sha256": {**actual, "encoders.py": "changed"}},
+                            {"actual_training_source_sha256": {**actual, "pretrain.py": "changed"}},
+                            {"run_signature": "other-run"}, {"recipe_fingerprint": "other-recipe"}):
+                path.write_text(json.dumps({**receipt, **changed}))
+                with self.assertRaises(ValueError):
+                    validate_resume_implementation(config, path, resume="auto", config_path=config_path)
+            path.write_text(json.dumps(receipt)); config_path.write_text(json.dumps(config) + "\n")
+            with self.assertRaisesRegex(ValueError, "config/source"):
+                validate_resume_implementation(config, path, resume="auto", config_path=config_path)
+
 
 @unittest.skipUnless(HAS_STACK, "PyTorch/TorchAudio/NumPy required")
 class PretrainStackTests(unittest.TestCase):
+    def test_amp_overflow_replays_same_group_and_rng_before_single_commit(self):
+        import random
+        import numpy as np
+        import torch
+        from marine_ssl.experiments.pretrain import backward_group, seed_everything
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__(); self.weight = torch.nn.Parameter(torch.tensor(.3)); self.draws = []
+            def forward(self, waveform, labels):
+                draw = (random.random(), float(np.random.random()), float(torch.rand(())))
+                self.draws.append(draw)
+                value = self.weight * (waveform.mean() + sum(draw))
+                return torch.stack((value, -value)).reshape(1, 2), None, value.square() * .01
+
+        # CPU fault injection models GradScaler's recorded found_inf/backoff;
+        # real AdamW/model/RNG still run, including replay and parameter equality.
+        class Scaler:
+            def __init__(self, overflows):
+                self.overflows = overflows; self.value = 8.; self.tracker = 7; self.commits = 0
+            def is_enabled(self): return True
+            def get_scale(self): return self.value
+            def scale(self, loss): return loss * self.value
+            def unscale_(self, optimizer):
+                self.found_inf = self.overflows > 0
+                for group in optimizer.param_groups:
+                    for p in group["params"]:
+                        p.grad.div_(self.value)
+                        if self.found_inf: p.grad.fill_(float("inf"))
+                if self.found_inf: self.overflows -= 1
+            def step(self, optimizer):
+                if not self.found_inf: optimizer.step(); self.commits += 1
+            def update(self):
+                if self.found_inf: self.value /= 2; self.tracker = 0
+                else: self.tracker += 1
+
+        batches = [{"waveform": torch.ones(1, 4), "labels": torch.zeros(1, 1, dtype=torch.long)}]
+        results = []
+        for overflows in (0, 1):
+            seed_everything(43)
+            model, scaler = Model(), Scaler(overflows)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=.01)
+            with patch("marine_ssl.experiments.pretrain._autocast", return_value=nullcontext()):
+                result = backward_group(model, optimizer, scaler, batches, device="cpu", precision="fp16")
+            self.assertEqual(scaler.commits, 0)
+            if overflows:
+                self.assertEqual(model.draws[0], model.draws[1])
+                self.assertEqual(scaler.tracker, 0); self.assertEqual(scaler.get_scale(), 4)
+            scaler.step(optimizer); scaler.update()
+            self.assertEqual(scaler.commits, 1)
+            results.append((model.weight.detach().clone(), random.random(), float(np.random.random()),
+                            float(torch.rand(())), result[3]))
+        self.assertTrue(torch.equal(results[0][0], results[1][0]))
+        self.assertEqual(results[0][1:4], results[1][1:4]); self.assertEqual(results[1][4], 1)
+
+        model, scaler = Model(), Scaler(20)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=.01)
+        before = model.weight.detach().clone()
+        with patch("marine_ssl.experiments.pretrain._autocast", return_value=nullcontext()):
+            with self.assertRaisesRegex(FloatingPointError, "bounded same-batch"):
+                backward_group(model, optimizer, scaler, batches, device="cpu", precision="fp16", max_retries=2)
+        self.assertEqual(len(model.draws), 3); self.assertEqual(scaler.commits, 0)
+        self.assertTrue(torch.equal(before, model.weight)); self.assertEqual(scaler.tracker, 0)
+
+        model, scaler = Model(), Scaler(0)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=.01)
+        with patch("marine_ssl.experiments.pretrain._autocast", return_value=nullcontext()), \
+             patch("marine_ssl.experiments.pretrain.objective_sum", return_value=(model.weight * float("nan"), 1)):
+            with self.assertRaisesRegex(FloatingPointError, "nonfinite HuBERT objective"):
+                backward_group(model, optimizer, scaler, batches, device="cpu", precision="fp16")
+        self.assertEqual(scaler.commits, 0)
+
     def test_cpu_telemetry_does_not_query_cuda(self):
         from marine_ssl.experiments.pretrain import device_telemetry
         with patch("torch.cuda.get_device_properties", side_effect=AssertionError("CUDA queried")), \
