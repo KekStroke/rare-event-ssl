@@ -32,3 +32,7 @@ accumulation group with restored RNG. Commit optimizer steps and data cursors
 only after a successful update. An implementation-only continuation retains
 the original config/signature and records actual patched source in an explicit
 verified resume receipt.
+
+Generate resume-receipt fingerprints with the project canonical serializer.
+Before queuing a GPU continuation, validate each concrete generated receipt
+against the real frozen trainer validator, rather than a stub or duplicate hash.
